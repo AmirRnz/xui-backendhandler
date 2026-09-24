@@ -303,7 +303,7 @@ func (h *Handler) requestRefund(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) pendingRefunds(w http.ResponseWriter, r *http.Request) {
-	a, ok := h.actor(w, r)
+	a, ok := h.adminActor(w, r)
 	if !ok {
 		return
 	}
@@ -316,7 +316,7 @@ func (h *Handler) pendingRefunds(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) approveRefund(w http.ResponseWriter, r *http.Request) {
-	a, ok := h.actor(w, r)
+	a, ok := h.adminActor(w, r)
 	if !ok {
 		return
 	}
@@ -410,7 +410,7 @@ func (h *Handler) topupReceipt(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{"topup_id": id, "status": "receipt_submitted"})
 }
 func (h *Handler) pendingTopups(w http.ResponseWriter, r *http.Request) {
-	a, ok := h.actor(w, r)
+	a, ok := h.adminActor(w, r)
 	if !ok {
 		return
 	}
@@ -422,7 +422,7 @@ func (h *Handler) pendingTopups(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, v)
 }
 func (h *Handler) approveTopup(w http.ResponseWriter, r *http.Request) {
-	a, ok := h.actor(w, r)
+	a, ok := h.adminActor(w, r)
 	if !ok {
 		return
 	}
@@ -461,7 +461,7 @@ func (h *Handler) paymentReceipt(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{"payment_intent_id": id, "status": "receipt_submitted"})
 }
 func (h *Handler) pendingPayments(w http.ResponseWriter, r *http.Request) {
-	a, ok := h.actor(w, r)
+	a, ok := h.adminActor(w, r)
 	if !ok {
 		return
 	}
@@ -473,7 +473,7 @@ func (h *Handler) pendingPayments(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, v)
 }
 func (h *Handler) approvePayment(w http.ResponseWriter, r *http.Request) {
-	a, ok := h.actor(w, r)
+	a, ok := h.adminActor(w, r)
 	if !ok {
 		return
 	}
@@ -490,7 +490,7 @@ func (h *Handler) approvePayment(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, v)
 }
 func (h *Handler) workItems(w http.ResponseWriter, r *http.Request) {
-	a, ok := h.actor(w, r)
+	a, ok := h.adminActor(w, r)
 	if !ok {
 		return
 	}

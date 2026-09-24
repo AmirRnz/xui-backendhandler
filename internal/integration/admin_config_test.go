@@ -224,3 +224,52 @@ func TestAuditSubjectRefMigrationUpgradesExisting008Schema(t *testing.T) {
 		t.Fatal("upgrade migration did not restore subject_ref")
 	}
 }
+
+func TestPrivilegedHTTPRoutesRequireDesignatedAdminIdentity(t *testing.T) {
+	s, _ := testStore(t)
+	ordinary := resolve(t, s, "retail-finland", 971992)
+	if _, err := s.DB.Exec(context.Background(), `UPDATE actors SET role='admin',approval_status='approved',enabled=true WHERE id=$1`, ordinary.ID); err != nil {
+		t.Fatal(err)
+	}
+	const token = "retail-finland-test-token-000000000000"
+	handler := api.New(s, config.Config{ClientCredentials: []config.ClientCredential{{DeploymentID: "retail-finland", Token: token}}}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	paths := []struct{ method, path string }{
+		{http.MethodGet, "/v1/admin/payments"},
+		{http.MethodPost, "/v1/payment-intents/1/approve"},
+		{http.MethodGet, "/v1/admin/topups"},
+		{http.MethodPost, "/v1/wallet/topups/1/approve"},
+		{http.MethodGet, "/v1/admin/refunds"},
+		{http.MethodPost, "/v1/admin/refunds/1/approve"},
+		{http.MethodGet, "/v1/admin/work-items"},
+		{http.MethodGet, "/v1/admin/config"},
+		{http.MethodGet, "/v1/admin/resellers/pending"},
+		{http.MethodPost, "/v1/admin/resellers/97654399/approve"},
+		{http.MethodPost, "/v1/admin/resellers/97654399/reject"},
+		{http.MethodPost, "/v1/admin/config/plans"},
+		{http.MethodPut, "/v1/admin/config/plans/1"},
+		{http.MethodPatch, "/v1/admin/config/payment-instructions"},
+		{http.MethodPatch, "/v1/admin/config/settings"},
+		{http.MethodPut, "/v1/admin/config/panel"},
+	}
+	for _, tc := range paths {
+		t.Run(tc.method+" "+tc.path, func(t *testing.T) {
+			req := httptest.NewRequest(tc.method, tc.path, strings.NewReader(`{}`))
+			req.Header.Set("Authorization", "Bearer "+token)
+			req.Header.Set("X-Actor-Telegram-ID", "971992")
+			req.Header.Set("Content-Type", "application/json")
+			rec := httptest.NewRecorder()
+			handler.ServeHTTP(rec, req)
+			if rec.Code != http.StatusForbidden {
+				t.Fatalf("database-assigned admin role bypassed designated ID guard: status=%d body=%s", rec.Code, rec.Body.String())
+			}
+		})
+	}
+	validReq := httptest.NewRequest(http.MethodGet, "/v1/admin/payments", nil)
+	validReq.Header.Set("Authorization", "Bearer "+token)
+	validReq.Header.Set("X-Actor-Telegram-ID", "96937669")
+	validRec := httptest.NewRecorder()
+	handler.ServeHTTP(validRec, validReq)
+	if validRec.Code != http.StatusOK {
+		t.Fatalf("designated administrator was denied an admin route: status=%d body=%s", validRec.Code, validRec.Body.String())
+	}
+}

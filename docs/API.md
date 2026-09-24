@@ -26,7 +26,7 @@ All routes except `/healthz` require `Authorization: Bearer <deployment-scoped-t
 
 ## Admin operations
 
-Admin/operator role is checked in the backend on every call and never inferred by a bot.
+The designated admin identity and deployment scope are checked in the backend on every admin or review call; a bot-supplied role is never trusted.
 
 | Method and path | Request | Result |
 |---|---|---|
