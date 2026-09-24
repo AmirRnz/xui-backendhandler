@@ -1,0 +1,4 @@
+.env
+*.log
+/backend
+/import-legacy
