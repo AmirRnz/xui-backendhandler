@@ -11,13 +11,18 @@ import (
 )
 
 func (h *Handler) adminActor(w http.ResponseWriter, r *http.Request) (*store.Actor, bool) {
+	deployment := principalFrom(r).DeploymentID
+	if deployment != "retail-finland" && deployment != "reseller-turk1" {
+		writeError(w, http.StatusForbidden, "forbidden", "administrator role is required")
+		return nil, false
+	}
 	raw := strings.TrimSpace(r.Header.Get("X-Actor-Telegram-ID"))
 	id, err := strconv.ParseInt(raw, 10, 64)
 	if err != nil || id <= 0 {
 		writeError(w, http.StatusBadRequest, "invalid_actor", "X-Actor-Telegram-ID must be a positive integer")
 		return nil, false
 	}
-	a, err := h.Store.Actor(r.Context(), principalFrom(r).DeploymentID, id)
+	a, err := h.Store.Actor(r.Context(), deployment, id)
 	if errors.Is(err, store.ErrNotFound) || errors.Is(err, store.ErrForbidden) {
 		writeError(w, http.StatusForbidden, "forbidden", "administrator role is required")
 		return nil, false
@@ -53,6 +58,46 @@ func (h *Handler) adminConfig(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, c)
 }
 
+func (h *Handler) adminPendingResellers(w http.ResponseWriter, r *http.Request) {
+	if _, ok := h.adminActor(w, r); !ok {
+		return
+	}
+	v, err := h.Store.PendingResellers(r.Context(), principalFrom(r).DeploymentID)
+	if err != nil {
+		h.fail(w, err)
+		return
+	}
+	writeJSON(w, 200, v)
+}
+
+func (h *Handler) adminApproveReseller(w http.ResponseWriter, r *http.Request) {
+	h.reviewReseller(w, r, "approved")
+}
+func (h *Handler) adminRejectReseller(w http.ResponseWriter, r *http.Request) {
+	h.reviewReseller(w, r, "rejected")
+}
+func (h *Handler) reviewReseller(w http.ResponseWriter, r *http.Request, status string) {
+	a, ok := h.adminActor(w, r)
+	if !ok {
+		return
+	}
+	tgID, err := strconv.ParseInt(r.PathValue("telegram_id"), 10, 64)
+	if err != nil || tgID <= 0 {
+		writeError(w, 400, "invalid_request", "reseller Telegram ID must be positive")
+		return
+	}
+	var empty struct{}
+	if !decode(w, r, &empty) {
+		return
+	}
+	v, err := h.Store.SetResellerApproval(r.Context(), principalFrom(r).DeploymentID, a.ID, tgID, status)
+	if err != nil {
+		h.adminConfigFail(w, err)
+		return
+	}
+	writeJSON(w, 200, v)
+}
+
 func (h *Handler) adminCreatePlan(w http.ResponseWriter, r *http.Request) {
 	a, ok := h.adminActor(w, r)
 	if !ok {
@@ -62,13 +107,9 @@ func (h *Handler) adminCreatePlan(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &p) {
 		return
 	}
-	id, err := h.Store.SaveAdminPlan(r.Context(), principalFrom(r).DeploymentID, p)
+	id, err := h.Store.SaveAdminPlan(r.Context(), principalFrom(r).DeploymentID, a.ID, p)
 	if err != nil {
 		h.adminConfigFail(w, err)
-		return
-	}
-	if err = h.Store.RecordAdminConfigChange(r.Context(), principalFrom(r).DeploymentID, a.ID, "plan_created"); err != nil {
-		h.fail(w, err)
 		return
 	}
 	c, err := h.Store.AdminConfiguration(r.Context(), principalFrom(r).DeploymentID)
@@ -94,12 +135,8 @@ func (h *Handler) adminUpdatePlan(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	p.ID = id
-	if _, err = h.Store.SaveAdminPlan(r.Context(), principalFrom(r).DeploymentID, p); err != nil {
+	if _, err = h.Store.SaveAdminPlan(r.Context(), principalFrom(r).DeploymentID, a.ID, p); err != nil {
 		h.adminConfigFail(w, err)
-		return
-	}
-	if err = h.Store.RecordAdminConfigChange(r.Context(), principalFrom(r).DeploymentID, a.ID, "plan_updated"); err != nil {
-		h.fail(w, err)
 		return
 	}
 	h.adminConfig(w, r)
@@ -118,12 +155,8 @@ func (h *Handler) adminPaymentInstructions(w http.ResponseWriter, r *http.Reques
 	if !decode(w, r, &q) {
 		return
 	}
-	if err := h.Store.SavePaymentInstructions(r.Context(), principalFrom(r).DeploymentID, q.CardNumber, q.CardOwner, q.Instructions); err != nil {
+	if err := h.Store.SavePaymentInstructions(r.Context(), principalFrom(r).DeploymentID, a.ID, q.CardNumber, q.CardOwner, q.Instructions); err != nil {
 		h.adminConfigFail(w, err)
-		return
-	}
-	if err := h.Store.RecordAdminConfigChange(r.Context(), principalFrom(r).DeploymentID, a.ID, "payment_instructions_updated"); err != nil {
-		h.fail(w, err)
 		return
 	}
 	h.adminConfig(w, r)
@@ -148,12 +181,8 @@ func (h *Handler) adminSettings(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 400, "invalid_request", "at least one setting is required")
 		return
 	}
-	if err := h.Store.PatchAdminSettings(r.Context(), principalFrom(r).DeploymentID, q.RetailTrialResetDays, q.UnapprovedTrialDailyLimit, q.ResellerApprovedRequired, q.Features, q.Text); err != nil {
+	if err := h.Store.PatchAdminSettings(r.Context(), principalFrom(r).DeploymentID, a.ID, q.RetailTrialResetDays, q.UnapprovedTrialDailyLimit, q.ResellerApprovedRequired, q.Features, q.Text); err != nil {
 		h.adminConfigFail(w, err)
-		return
-	}
-	if err := h.Store.RecordAdminConfigChange(r.Context(), principalFrom(r).DeploymentID, a.ID, "settings_updated"); err != nil {
-		h.fail(w, err)
 		return
 	}
 	h.adminConfig(w, r)
@@ -184,12 +213,8 @@ func (h *Handler) adminPanel(w http.ResponseWriter, r *http.Request) {
 		h.fail(w, err)
 		return
 	}
-	if err = h.Store.SavePanelConfig(r.Context(), principalFrom(r).DeploymentID, q.BaseURL, ciphertext); err != nil {
+	if err = h.Store.SavePanelConfig(r.Context(), principalFrom(r).DeploymentID, a.ID, q.BaseURL, ciphertext); err != nil {
 		h.adminConfigFail(w, err)
-		return
-	}
-	if err = h.Store.RecordAdminConfigChange(r.Context(), principalFrom(r).DeploymentID, a.ID, "panel_config_updated"); err != nil {
-		h.fail(w, err)
 		return
 	}
 	h.adminConfig(w, r)

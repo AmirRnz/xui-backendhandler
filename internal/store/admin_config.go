@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/url"
 	"strings"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 )
@@ -40,6 +41,13 @@ type AdminConfiguration struct {
 	PaymentInstructions map[string]string `json:"payment_instructions"`
 	Settings            map[string]any    `json:"settings"`
 	Panel               map[string]any    `json:"panel"`
+}
+
+type ResellerReview struct {
+	TelegramID     int64     `json:"telegram_id"`
+	ActorID        int64     `json:"actor_id,omitempty"`
+	ApprovalStatus string    `json:"approval_status"`
+	CreatedAt      time.Time `json:"created_at"`
 }
 
 func (s *Store) AdminConfiguration(ctx context.Context, deployment string) (*AdminConfiguration, error) {
@@ -118,21 +126,35 @@ func validateAdminPlan(p AdminPlan) error {
 	return nil
 }
 
-func (s *Store) SaveAdminPlan(ctx context.Context, deployment string, p AdminPlan) (int64, error) {
+func (s *Store) SaveAdminPlan(ctx context.Context, deployment string, actorID int64, p AdminPlan) (int64, error) {
 	if err := validateAdminPlan(p); err != nil {
 		return 0, err
 	}
+	tx, err := s.DB.Begin(ctx)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback(ctx)
 	var panelID string
-	if err := s.DB.QueryRow(ctx, `SELECT default_panel_id FROM deployments WHERE id=$1 AND enabled`, deployment).Scan(&panelID); err != nil {
+	if err := tx.QueryRow(ctx, `SELECT default_panel_id FROM deployments WHERE id=$1 AND enabled`, deployment).Scan(&panelID); err != nil {
 		return 0, err
 	}
 	if p.ID == 0 {
-		err := s.DB.QueryRow(ctx, `INSERT INTO plans(deployment_id,panel_id,kind,name,enabled,is_limited,description,base_price_toman,price_per_extra_ip_toman,
+		err := tx.QueryRow(ctx, `INSERT INTO plans(deployment_id,panel_id,kind,name,enabled,is_limited,description,base_price_toman,price_per_extra_ip_toman,
 		price_per_gb_toman,price_per_extra_month_toman,base_ip_limit,max_ip_limit,min_data_gb,max_data_bytes,expire_seconds,test_ip_limit,max_per_day,flow,inbound_ids,usage_description)
 		VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21) RETURNING id`, deployment, panelID, p.Kind, strings.TrimSpace(p.Name), p.Enabled, p.IsLimited, p.Description, p.BasePriceToman, p.PricePerExtraIPToman, p.PricePerGBToman, p.PricePerExtraMonthToman, p.BaseIPLimit, p.MaxIPLimit, p.MinDataGB, p.MaxDataBytes, p.ExpireSeconds, p.TestIPLimit, p.MaxPerDay, p.Flow, p.InboundIDs, p.UsageDescription).Scan(&p.ID)
-		return p.ID, err
+		if err != nil {
+			return 0, err
+		}
+		if err = recordAdminAudit(ctx, tx, deployment, actorID, "plan_created"); err != nil {
+			return 0, err
+		}
+		if err = tx.Commit(ctx); err != nil {
+			return 0, err
+		}
+		return p.ID, nil
 	}
-	tag, err := s.DB.Exec(ctx, `UPDATE plans SET name=$3,kind=$4,enabled=$5,is_limited=$6,description=$7,base_price_toman=$8,price_per_extra_ip_toman=$9,
+	tag, err := tx.Exec(ctx, `UPDATE plans SET name=$3,kind=$4,enabled=$5,is_limited=$6,description=$7,base_price_toman=$8,price_per_extra_ip_toman=$9,
 		price_per_gb_toman=$10,price_per_extra_month_toman=$11,base_ip_limit=$12,max_ip_limit=$13,min_data_gb=$14,max_data_bytes=$15,expire_seconds=$16,
 		test_ip_limit=$17,max_per_day=$18,flow=$19,inbound_ids=$20,usage_description=$21,updated_at=now() WHERE deployment_id=$1 AND id=$2`, deployment, p.ID, strings.TrimSpace(p.Name), p.Kind, p.Enabled, p.IsLimited, p.Description, p.BasePriceToman, p.PricePerExtraIPToman, p.PricePerGBToman, p.PricePerExtraMonthToman, p.BaseIPLimit, p.MaxIPLimit, p.MinDataGB, p.MaxDataBytes, p.ExpireSeconds, p.TestIPLimit, p.MaxPerDay, p.Flow, p.InboundIDs, p.UsageDescription)
 	if err != nil {
@@ -141,24 +163,38 @@ func (s *Store) SaveAdminPlan(ctx context.Context, deployment string, p AdminPla
 	if tag.RowsAffected() == 0 {
 		return 0, pgx.ErrNoRows
 	}
+	if err = recordAdminAudit(ctx, tx, deployment, actorID, "plan_updated"); err != nil {
+		return 0, err
+	}
+	if err = tx.Commit(ctx); err != nil {
+		return 0, err
+	}
 	return p.ID, nil
 }
 
-func (s *Store) SavePaymentInstructions(ctx context.Context, deployment, card, owner, instructions string) error {
+func (s *Store) SavePaymentInstructions(ctx context.Context, deployment string, actorID int64, card, owner, instructions string) error {
 	if len(card) > 80 || len(owner) > 160 || len(instructions) > 4000 {
 		return fmt.Errorf("%w: payment instructions exceed allowed length", ErrInvalidAdminConfig)
 	}
-	tag, err := s.DB.Exec(ctx, `UPDATE deployments SET payment_card_number=$2,payment_card_owner=$3,payment_instructions=$4 WHERE id=$1`, deployment, strings.TrimSpace(card), strings.TrimSpace(owner), strings.TrimSpace(instructions))
+	tx, err := s.DB.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	tag, err := tx.Exec(ctx, `UPDATE deployments SET payment_card_number=$2,payment_card_owner=$3,payment_instructions=$4 WHERE id=$1`, deployment, strings.TrimSpace(card), strings.TrimSpace(owner), strings.TrimSpace(instructions))
 	if err != nil {
 		return err
 	}
 	if tag.RowsAffected() == 0 {
 		return pgx.ErrNoRows
 	}
-	return nil
+	if err = recordAdminAudit(ctx, tx, deployment, actorID, "payment_instructions_updated"); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
 }
 
-func (s *Store) PatchAdminSettings(ctx context.Context, deployment string, resetDays, unapprovedLimit *int, approvedRequired *bool, features, text map[string]any) error {
+func (s *Store) PatchAdminSettings(ctx context.Context, deployment string, actorID int64, resetDays, unapprovedLimit *int, approvedRequired *bool, features, text map[string]any) error {
 	if resetDays != nil && (*resetDays < -3650 || *resetDays > 36500) {
 		return fmt.Errorf("%w: retail_trial_reset_days outside allowed bounds", ErrInvalidAdminConfig)
 	}
@@ -203,6 +239,9 @@ func (s *Store) PatchAdminSettings(ctx context.Context, deployment string, reset
 	if _, err = tx.Exec(ctx, `UPDATE deployments SET retail_trial_reset_days=COALESCE($2,retail_trial_reset_days),unapproved_trial_daily_limit=COALESCE($3,unapproved_trial_daily_limit),configuration=$4::jsonb WHERE id=$1`, deployment, resetDays, unapprovedLimit, encoded); err != nil {
 		return err
 	}
+	if err = recordAdminAudit(ctx, tx, deployment, actorID, "settings_updated"); err != nil {
+		return err
+	}
 	return tx.Commit(ctx)
 }
 
@@ -238,19 +277,27 @@ func mergeConfigMap(dst, src map[string]any) map[string]any {
 	return dst
 }
 
-func (s *Store) SavePanelConfig(ctx context.Context, deployment, baseURL string, ciphertext []byte) error {
+func (s *Store) SavePanelConfig(ctx context.Context, deployment string, actorID int64, baseURL string, ciphertext []byte) error {
 	u, err := url.ParseRequestURI(strings.TrimSpace(baseURL))
 	if err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" || len(baseURL) > 500 {
 		return fmt.Errorf("%w: panel base_url must be an HTTP(S) URL", ErrInvalidAdminConfig)
 	}
-	tag, err := s.DB.Exec(ctx, `UPDATE panels p SET base_url=$2,encrypted_api_token=COALESCE($3,p.encrypted_api_token) FROM deployments d WHERE d.id=$1 AND p.id=d.default_panel_id`, deployment, strings.TrimRight(baseURL, "/"), nullBytes(ciphertext))
+	tx, err := s.DB.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	tag, err := tx.Exec(ctx, `UPDATE panels p SET base_url=$2,encrypted_api_token=COALESCE($3,p.encrypted_api_token) FROM deployments d WHERE d.id=$1 AND p.id=d.default_panel_id`, deployment, strings.TrimRight(baseURL, "/"), nullBytes(ciphertext))
 	if err != nil {
 		return err
 	}
 	if tag.RowsAffected() == 0 {
 		return pgx.ErrNoRows
 	}
-	return nil
+	if err = recordAdminAudit(ctx, tx, deployment, actorID, "panel_config_updated"); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
 }
 
 func nullBytes(b []byte) any {
@@ -290,7 +337,78 @@ func (s *Store) PublicFeatures(ctx context.Context, deployment string) (map[stri
 	return map[string]any{"features": asMap(c["features"]), "text": asMap(c["text"])}, nil
 }
 
-func (s *Store) RecordAdminConfigChange(ctx context.Context, deployment string, actorID int64, action string) error {
-	_, err := s.DB.Exec(ctx, `INSERT INTO admin_configuration_audit(deployment_id,actor_id,action) VALUES($1,$2,$3)`, deployment, actorID, action)
-	return err
+func (s *Store) PendingResellers(ctx context.Context, deployment string) ([]ResellerReview, error) {
+	rows, err := s.DB.Query(ctx, `SELECT a.telegram_id,a.id,a.approval_status,a.created_at FROM actors a JOIN deployments d ON d.id=a.deployment_id
+		WHERE a.deployment_id=$1 AND d.channel='reseller' AND a.role='reseller' AND a.approval_status='pending' AND a.enabled
+		ORDER BY a.created_at,a.id`, deployment)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	result := make([]ResellerReview, 0)
+	for rows.Next() {
+		var v ResellerReview
+		if err = rows.Scan(&v.TelegramID, &v.ActorID, &v.ApprovalStatus, &v.CreatedAt); err != nil {
+			return nil, err
+		}
+		result = append(result, v)
+	}
+	return result, rows.Err()
+}
+
+func (s *Store) SetResellerApproval(ctx context.Context, deployment string, adminID, telegramID int64, status string) (*ResellerReview, error) {
+	if err := validateResellerDecision("pending", status); err != nil {
+		return nil, err
+	}
+	tx, err := s.DB.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback(ctx)
+	v := &ResellerReview{TelegramID: telegramID, ApprovalStatus: status}
+	var currentStatus string
+	err = tx.QueryRow(ctx, `SELECT a.id,a.approval_status FROM actors a JOIN deployments d ON d.id=a.deployment_id
+		WHERE a.deployment_id=$1 AND d.channel='reseller' AND a.telegram_id=$2 AND a.role='reseller' AND a.enabled FOR UPDATE OF a`, deployment, telegramID).Scan(&v.ActorID, &currentStatus)
+	if err != nil {
+		return nil, err
+	}
+	if err = validateResellerDecision(currentStatus, status); err != nil {
+		return nil, err
+	}
+	tag, err := tx.Exec(ctx, `UPDATE actors SET approval_status=$3,updated_at=now() WHERE id=$1 AND deployment_id=$2 AND approval_status='pending'`, v.ActorID, deployment, status)
+	if err != nil {
+		return nil, err
+	}
+	if tag.RowsAffected() != 1 {
+		return nil, ErrConflict
+	}
+	if err = recordAdminAudit(ctx, tx, deployment, adminID, "reseller_"+status); err != nil {
+		return nil, err
+	}
+	if err = tx.Commit(ctx); err != nil {
+		return nil, err
+	}
+	return v, nil
+}
+
+func validateResellerDecision(current, target string) error {
+	if target != "approved" && target != "rejected" {
+		return fmt.Errorf("%w: reseller approval status must be approved or rejected", ErrInvalidAdminConfig)
+	}
+	if current != "pending" {
+		return ErrConflict
+	}
+	return nil
+}
+
+func recordAdminAudit(ctx context.Context, tx pgx.Tx, deployment string, actorID int64, action string) error {
+	tag, err := tx.Exec(ctx, `INSERT INTO admin_configuration_audit(deployment_id,actor_id,action)
+		SELECT $1,id,$3 FROM actors WHERE id=$2 AND deployment_id=$1 AND deployment_id IN ('retail-finland','reseller-turk1') AND telegram_id=96937669 AND role='admin' AND enabled AND approval_status='approved'`, deployment, actorID, action)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() != 1 {
+		return ErrForbidden
+	}
+	return nil
 }

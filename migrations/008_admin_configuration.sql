@@ -31,6 +31,3 @@ FROM deployments d JOIN commercial_accounts a ON a.home_deployment_id=d.id AND a
 WHERE d.id IN ('retail-finland','reseller-turk1')
 ON CONFLICT(deployment_id,telegram_id)
 DO UPDATE SET identity_provider='telegram',external_subject='96937669',role='admin',approval_status='approved',enabled=true,updated_at=now();
-
-UPDATE actors a SET role=CASE WHEN d.channel='reseller' THEN 'reseller' ELSE 'customer' END
-FROM deployments d WHERE d.id=a.deployment_id AND d.id='retail-germany' AND a.telegram_id=96937669;

@@ -38,6 +38,9 @@ Admin/operator role is checked in the backend on every call and never inferred b
 | `POST /v1/admin/refunds/{id}/approve` | `amount_toman, audit_note, idempotency_key, manual_override` | Credits only after verified cancellation and within the immutable paid cap, unless an explicit reasoned manual override is recorded |
 | `GET /v1/admin/work-items` | none | Durable work needing operational attention |
 | `GET /v1/admin/config` | admin actor header | Deployment-scoped plan catalog, payment instructions, settings, and panel URL/configured status; never includes a panel token |
+| `GET /v1/admin/resellers/pending` | admin actor header | Pending reseller accounts in this reseller deployment only |
+| `POST /v1/admin/resellers/{telegram_id}/approve` | `{}` | Approves a pending reseller in this deployment; action and admin actor are audited in the same transaction |
+| `POST /v1/admin/resellers/{telegram_id}/reject` | `{}` | Rejects a reseller in this deployment; action and admin actor are audited in the same transaction |
 | `POST /v1/admin/config/plans` | full plan object, without `id` | Creates a deployment-owned plan and returns `{id,config}` |
 | `PUT /v1/admin/config/plans/{id}` | full plan object | Updates only a plan owned by this deployment and returns refreshed config |
 | `PATCH /v1/admin/config/payment-instructions` | `card_number, card_owner, instructions` | Replaces this deployment's payment instructions |

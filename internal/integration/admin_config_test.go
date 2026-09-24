@@ -4,15 +4,18 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 
 	"example.com/xui-commerce/backend/internal/api"
 	"example.com/xui-commerce/backend/internal/config"
+	"example.com/xui-commerce/backend/internal/store"
 )
 
 func TestAdminConfigIsDeploymentScopedAndSecretsAreWriteOnly(t *testing.T) {
@@ -21,6 +24,10 @@ func TestAdminConfigIsDeploymentScopedAndSecretsAreWriteOnly(t *testing.T) {
 	const finToken = "retail-finland-test-token-000000000000"
 	const resToken = "reseller-turk1-test-token-000000000000"
 	const gerToken = "retail-germany-test-token-000000000000"
+	germanyAdmin := resolve(t, s, "retail-germany", 96937669)
+	if _, err := s.DB.Exec(ctx, `UPDATE actors SET role='admin',approval_status='approved' WHERE id=$1`, germanyAdmin.ID); err != nil {
+		t.Fatal(err)
+	}
 	key := bytes.Repeat([]byte{7}, 32)
 	handler := api.New(s, config.Config{PanelSecretsKey: key, ClientCredentials: []config.ClientCredential{{DeploymentID: "retail-finland", Token: finToken}, {DeploymentID: "reseller-turk1", Token: resToken}, {DeploymentID: "retail-germany", Token: gerToken}}}, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	request := func(method, path, token, actor, body string) *httptest.ResponseRecorder {
@@ -42,6 +49,13 @@ func TestAdminConfigIsDeploymentScopedAndSecretsAreWriteOnly(t *testing.T) {
 	}
 	if rec := request(http.MethodGet, "/v1/admin/config", gerToken, "96937669", ""); rec.Code != http.StatusForbidden {
 		t.Fatalf("Germany should not inherit admin: %d %s", rec.Code, rec.Body.String())
+	}
+	var germanyRole string
+	if err := s.DB.QueryRow(ctx, `SELECT role FROM actors WHERE id=$1`, germanyAdmin.ID).Scan(&germanyRole); err != nil {
+		t.Fatal(err)
+	}
+	if germanyRole != "admin" {
+		t.Fatalf("admin config request unexpectedly modified Germany actor: %q", germanyRole)
 	}
 	if rec := request(http.MethodGet, "/v1/admin/config", finToken, "971991", ""); rec.Code != http.StatusForbidden {
 		t.Fatalf("ordinary actor accessed admin config: %d %s", rec.Code, rec.Body.String())
@@ -88,5 +102,83 @@ func TestAdminConfigIsDeploymentScopedAndSecretsAreWriteOnly(t *testing.T) {
 	}
 	if audits < 4 {
 		t.Fatalf("expected configuration changes to be audited, got %d", audits)
+	}
+}
+
+func TestResellerReviewIsDeploymentScopedAndAuditedAtomically(t *testing.T) {
+	s, _ := testStore(t)
+	ctx := context.Background()
+	admin := resolve(t, s, "reseller-turk1", 96937669)
+	applicant := resolve(t, s, "reseller-turk1", 97654321)
+	if applicant.Role != "reseller" || applicant.ApprovalStatus != "pending" {
+		t.Fatalf("unexpected reseller applicant: %+v", applicant)
+	}
+	const token = "reseller-turk1-test-token-000000000000"
+	handler := api.New(s, config.Config{ClientCredentials: []config.ClientCredential{{DeploymentID: "reseller-turk1", Token: token}}}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	request := func(method, path, actor, body string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(method, path, strings.NewReader(body))
+		req.Header.Set("Authorization", "Bearer "+token)
+		req.Header.Set("X-Actor-Telegram-ID", actor)
+		req.Header.Set("Content-Type", "application/json")
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		return rec
+	}
+	pending := request(http.MethodGet, "/v1/admin/resellers/pending", "96937669", "")
+	if pending.Code != 200 || !strings.Contains(pending.Body.String(), "97654321") {
+		t.Fatalf("pending reseller list status=%d body=%s", pending.Code, pending.Body.String())
+	}
+	approved := request(http.MethodPost, "/v1/admin/resellers/97654321/approve", "96937669", `{}`)
+	if approved.Code != 200 || !strings.Contains(approved.Body.String(), `"approval_status":"approved"`) {
+		t.Fatalf("reseller approval status=%d body=%s", approved.Code, approved.Body.String())
+	}
+	if rec := request(http.MethodGet, "/v1/admin/resellers/pending", "96937669", ""); rec.Code != 200 || strings.Contains(rec.Body.String(), "97654321") {
+		t.Fatalf("approved reseller remained pending: status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if rec := request(http.MethodPost, "/v1/admin/resellers/97654321/reject", "96937669", `{}`); rec.Code != http.StatusConflict {
+		t.Fatalf("review replay should conflict, status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	concurrentApplicant := resolve(t, s, "reseller-turk1", 97654322)
+	results := make(chan error, 2)
+	var wg sync.WaitGroup
+	for _, decision := range []string{"approved", "rejected"} {
+		wg.Add(1)
+		go func(status string) {
+			defer wg.Done()
+			_, err := s.SetResellerApproval(ctx, "reseller-turk1", admin.ID, concurrentApplicant.TelegramID, status)
+			results <- err
+		}(decision)
+	}
+	wg.Wait()
+	close(results)
+	successes, conflicts := 0, 0
+	for err := range results {
+		if err == nil {
+			successes++
+		} else if errors.Is(err, store.ErrConflict) {
+			conflicts++
+		} else {
+			t.Fatalf("unexpected concurrent review error: %v", err)
+		}
+	}
+	if successes != 1 || conflicts != 1 {
+		t.Fatalf("concurrent review was not a single pending transition: success=%d conflicts=%d", successes, conflicts)
+	}
+	var reviews int
+	if err := s.DB.QueryRow(ctx, `SELECT count(*) FROM admin_configuration_audit WHERE deployment_id='reseller-turk1' AND actor_id=$1 AND action IN ('reseller_approved','reseller_rejected')`, admin.ID).Scan(&reviews); err != nil {
+		t.Fatal(err)
+	}
+	if reviews != 2 {
+		t.Fatalf("expected one audit per winning review transition, got %d", reviews)
+	}
+	if err := s.SavePaymentInstructions(ctx, "retail-finland", 0, "should-rollback", "", ""); err == nil {
+		t.Fatal("configuration change with invalid admin actor unexpectedly succeeded")
+	}
+	var card string
+	if err := s.DB.QueryRow(ctx, `SELECT payment_card_number FROM deployments WHERE id='retail-finland'`).Scan(&card); err != nil {
+		t.Fatal(err)
+	}
+	if card != "" {
+		t.Fatal("configuration write was committed without its audit row")
 	}
 }
