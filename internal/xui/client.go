@@ -11,6 +11,8 @@ import (
 	"net/url"
 	"strings"
 	"time"
+
+	"example.com/xui-commerce/backend/internal/panelurl"
 )
 
 const SupportedWriteVersion = "3.8.5"
@@ -78,9 +80,12 @@ type envelope struct {
 }
 
 func New(baseURL, apiToken string, timeout time.Duration) (*Client, error) {
+	if err := panelurl.Validate(baseURL); err != nil {
+		return nil, fmt.Errorf("invalid panel base URL: %w", err)
+	}
 	u, err := url.Parse(strings.TrimRight(strings.TrimSpace(baseURL), "/"))
-	if err != nil || u.Scheme == "" || u.Host == "" || (u.Scheme != "https" && u.Scheme != "http") {
-		return nil, fmt.Errorf("invalid panel base URL")
+	if err != nil {
+		return nil, fmt.Errorf("invalid panel base URL: %w", err)
 	}
 	if strings.TrimSpace(apiToken) == "" {
 		return nil, fmt.Errorf("panel API token is required")

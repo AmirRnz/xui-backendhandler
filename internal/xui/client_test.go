@@ -9,6 +9,23 @@ import (
 	"time"
 )
 
+func TestNewPanelURLTransportPolicy(t *testing.T) {
+	for _, tt := range []struct {
+		url   string
+		valid bool
+	}{
+		{url: "https://panel.example.test", valid: true},
+		{url: "http://127.0.0.1:8088", valid: true},
+		{url: "http://localhost:8088", valid: true},
+		{url: "http://panel.example.test", valid: false},
+	} {
+		_, err := New(tt.url, "test-panel-token", time.Second)
+		if (err == nil) != tt.valid {
+			t.Errorf("New(%q) error = %v, want valid=%t", tt.url, err, tt.valid)
+		}
+	}
+}
+
 func TestVersionGateRejectsNearbyPanelReleaseBeforeWrite(t *testing.T) {
 	writes := 0
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

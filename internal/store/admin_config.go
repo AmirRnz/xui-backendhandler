@@ -4,11 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"net/url"
 	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
+
+	"example.com/xui-commerce/backend/internal/panelurl"
 )
 
 type AdminPlan struct {
@@ -278,9 +279,8 @@ func mergeConfigMap(dst, src map[string]any) map[string]any {
 }
 
 func (s *Store) SavePanelConfig(ctx context.Context, deployment string, actorID int64, baseURL string, ciphertext []byte) error {
-	u, err := url.ParseRequestURI(strings.TrimSpace(baseURL))
-	if err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" || len(baseURL) > 500 {
-		return fmt.Errorf("%w: panel base_url must be an HTTP(S) URL", ErrInvalidAdminConfig)
+	if err := panelurl.Validate(baseURL); err != nil {
+		return fmt.Errorf("%w: %v", ErrInvalidAdminConfig, err)
 	}
 	tx, err := s.DB.Begin(ctx)
 	if err != nil {
