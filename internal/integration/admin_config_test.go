@@ -61,6 +61,7 @@ func TestAdminConfigIsDeploymentScopedAndSecretsAreWriteOnly(t *testing.T) {
 	if rec := request(http.MethodGet, "/v1/admin/config", finToken, "971991", ""); rec.Code != http.StatusForbidden {
 		t.Fatalf("ordinary actor accessed admin config: %d %s", rec.Code, rec.Body.String())
 	}
+	resolve(t, s, "retail-finland", 971991)
 	if rec := request(http.MethodGet, "/v1/features", finToken, "971991", ""); rec.Code != 200 {
 		t.Fatalf("public feature config status=%d body=%s", rec.Code, rec.Body.String())
 	}
