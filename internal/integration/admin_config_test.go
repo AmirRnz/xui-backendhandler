@@ -203,3 +203,24 @@ func TestResellerReviewIsDeploymentScopedAndAuditedAtomically(t *testing.T) {
 		t.Fatal("configuration write was committed without its audit row")
 	}
 }
+
+func TestAuditSubjectRefMigrationUpgradesExisting008Schema(t *testing.T) {
+	s, _ := testStore(t)
+	ctx := context.Background()
+	if _, err := s.DB.Exec(ctx, `ALTER TABLE admin_configuration_audit DROP COLUMN subject_ref`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.DB.Exec(ctx, `DELETE FROM schema_migrations WHERE version='009_admin_audit_subject_ref.sql'`); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Migrate(ctx); err != nil {
+		t.Fatalf("apply upgrade migration: %v", err)
+	}
+	var exists bool
+	if err := s.DB.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM information_schema.columns WHERE table_schema=current_schema() AND table_name='admin_configuration_audit' AND column_name='subject_ref')`).Scan(&exists); err != nil {
+		t.Fatal(err)
+	}
+	if !exists {
+		t.Fatal("upgrade migration did not restore subject_ref")
+	}
+}
