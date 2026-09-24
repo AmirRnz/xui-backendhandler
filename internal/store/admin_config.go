@@ -49,6 +49,7 @@ type AdminConfiguration struct {
 type ResellerReview struct {
 	TelegramID     int64     `json:"telegram_id"`
 	ActorID        int64     `json:"actor_id,omitempty"`
+	AccountID      int64     `json:"-"`
 	ApprovalStatus string    `json:"approval_status"`
 	CreatedAt      time.Time `json:"created_at"`
 }
@@ -405,8 +406,8 @@ func (s *Store) SetResellerApproval(ctx context.Context, deployment string, admi
 	defer tx.Rollback(ctx)
 	v := &ResellerReview{TelegramID: telegramID, ApprovalStatus: status}
 	var currentStatus string
-	err = tx.QueryRow(ctx, `SELECT a.id,a.approval_status FROM actors a JOIN deployments d ON d.id=a.deployment_id
-		WHERE a.deployment_id=$1 AND d.channel='reseller' AND a.telegram_id=$2 AND a.role='reseller' AND a.enabled FOR UPDATE OF a`, deployment, telegramID).Scan(&v.ActorID, &currentStatus)
+	err = tx.QueryRow(ctx, `SELECT a.id,a.account_id,a.approval_status FROM actors a JOIN deployments d ON d.id=a.deployment_id
+		WHERE a.deployment_id=$1 AND d.channel='reseller' AND a.telegram_id=$2 AND a.role='reseller' AND a.enabled FOR UPDATE OF a`, deployment, telegramID).Scan(&v.ActorID, &v.AccountID, &currentStatus)
 	if err != nil {
 		return nil, err
 	}
@@ -421,6 +422,14 @@ func (s *Store) SetResellerApproval(ctx context.Context, deployment string, admi
 		return nil, ErrConflict
 	}
 	if err = recordAdminAudit(ctx, tx, deployment, adminID, "reseller_"+status, fmt.Sprintf("telegram:%d", telegramID)); err != nil {
+		return nil, err
+	}
+	topic := "reseller.access_approved"
+	if status == "rejected" {
+		topic = "reseller.access_rejected"
+	}
+	if _, err = tx.Exec(ctx, `INSERT INTO outbox(deployment_id,account_id,actor_id,dedupe_key,topic,payload)
+		VALUES($1,$2,$3,$4,$5,'{}'::jsonb) ON CONFLICT(deployment_id,dedupe_key) DO NOTHING`, deployment, v.AccountID, v.ActorID, fmt.Sprintf("reseller-access-decision:%d", v.ActorID), topic); err != nil {
 		return nil, err
 	}
 	if err = tx.Commit(ctx); err != nil {

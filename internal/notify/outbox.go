@@ -118,6 +118,10 @@ func formatMessage(topic string, payload any) string {
 		telegramID, _ := m["telegram_id"].(float64)
 		requestID, _ := m["request_id"].(float64)
 		return fmt.Sprintf("درخواست دسترسی نمایندگی جدید:\nآیدی تلگرام: %.0f\nشناسه درخواست: %.0f\nبرای بررسی، منوی درخواست‌های reseller را باز کنید.", telegramID, requestID)
+	case "reseller.access_approved":
+		return "درخواست دسترسی نمایندگی شما تأیید شد. برای باز کردن یا تازه‌سازی منوی نمایندگی، /start را ارسال کنید."
+	case "reseller.access_rejected":
+		return "درخواست دسترسی نمایندگی شما رد شد. برای دیدن گزینه‌های موجود یا پیگیری، /start را ارسال کنید و با پشتیبانی تماس بگیرید."
 	default:
 		if status != "" {
 			return fmt.Sprintf("وضعیت درخواست %s: %s", name, status)

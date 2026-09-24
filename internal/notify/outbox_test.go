@@ -13,3 +13,18 @@ func TestResellerAccessRequestedMessage(t *testing.T) {
 		}
 	}
 }
+
+func TestResellerAccessDecisionMessagesGuideApplicant(t *testing.T) {
+	for _, tc := range []struct {
+		topic string
+		want  string
+	}{
+		{"reseller.access_approved", "تأیید شد"},
+		{"reseller.access_rejected", "رد شد"},
+	} {
+		message := formatMessage(tc.topic, map[string]any{})
+		if !strings.Contains(message, tc.want) || !strings.Contains(message, "/start") {
+			t.Errorf("%s message lacks decision or menu guidance: %q", tc.topic, message)
+		}
+	}
+}

@@ -3,6 +3,8 @@ package integration
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -148,6 +150,72 @@ func TestConcurrentResellerAccessClicksQueueOneNotification(t *testing.T) {
 	}
 	if requests != 1 || notifications != 1 {
 		t.Fatalf("concurrent clicks created duplicates: requests=%d notifications=%d", requests, notifications)
+	}
+}
+
+func TestResellerApprovalAndRejectionNotifyApplicantDurablyOnce(t *testing.T) {
+	s, _ := testStore(t)
+	ctx := context.Background()
+	admin := resolve(t, s, "reseller-turk1", 96937669)
+	approved := resolve(t, s, "reseller-turk1", 97654390)
+	rejected := resolve(t, s, "reseller-turk1", 97654391)
+	retailCollision := resolve(t, s, "retail-finland", approved.TelegramID)
+	for _, tc := range []struct {
+		applicant     *store.Actor
+		status, topic string
+	}{
+		{approved, "approved", "reseller.access_approved"},
+		{rejected, "rejected", "reseller.access_rejected"},
+	} {
+		if _, err := s.SetResellerApproval(ctx, "reseller-turk1", admin.ID, tc.applicant.TelegramID, tc.status); err != nil {
+			t.Fatalf("set reseller status %s: %v", tc.status, err)
+		}
+		var deployment string
+		var accountID, actorID int64
+		var topic string
+		var count int
+		if err := s.DB.QueryRow(ctx, `SELECT deployment_id,account_id,actor_id,topic,count(*) OVER() FROM outbox WHERE deployment_id='reseller-turk1' AND dedupe_key=$1`, fmt.Sprintf("reseller-access-decision:%d", tc.applicant.ID)).Scan(&deployment, &accountID, &actorID, &topic, &count); err != nil {
+			t.Fatal(err)
+		}
+		if deployment != "reseller-turk1" || accountID != tc.applicant.AccountID || actorID != tc.applicant.ID || topic != tc.topic || count != 1 {
+			t.Fatalf("decision notification scope/topic mismatch: deployment=%s account=%d actor=%d topic=%s count=%d", deployment, accountID, actorID, topic, count)
+		}
+		if _, err := s.SetResellerApproval(ctx, "reseller-turk1", admin.ID, tc.applicant.TelegramID, tc.status); !errors.Is(err, store.ErrConflict) {
+			t.Fatalf("decision replay should not create another notification: %v", err)
+		}
+		if err := s.DB.QueryRow(ctx, `SELECT count(*) FROM outbox WHERE deployment_id='reseller-turk1' AND actor_id=$1 AND topic=$2`, tc.applicant.ID, tc.topic).Scan(&count); err != nil {
+			t.Fatal(err)
+		}
+		if count != 1 {
+			t.Fatalf("replayed decision queued %d applicant notifications", count)
+		}
+	}
+	var collisionNotifications int
+	if err := s.DB.QueryRow(ctx, `SELECT count(*) FROM outbox WHERE deployment_id='retail-finland' AND actor_id=$1`, retailCollision.ID).Scan(&collisionNotifications); err != nil {
+		t.Fatal(err)
+	}
+	if collisionNotifications != 0 {
+		t.Fatalf("reseller decision notification crossed into colliding retail actor: %d", collisionNotifications)
+	}
+}
+
+func TestResellerDecisionNotificationRollsBackWithUnauthorizedAdmin(t *testing.T) {
+	s, _ := testStore(t)
+	ctx := context.Background()
+	applicant := resolve(t, s, "reseller-turk1", 97654392)
+	if _, err := s.SetResellerApproval(ctx, "reseller-turk1", 0, applicant.TelegramID, "approved"); !errors.Is(err, store.ErrForbidden) {
+		t.Fatalf("unauthorized decision error = %v", err)
+	}
+	var status string
+	var notifications int
+	if err := s.DB.QueryRow(ctx, `SELECT approval_status FROM actors WHERE id=$1`, applicant.ID).Scan(&status); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.DB.QueryRow(ctx, `SELECT count(*) FROM outbox WHERE deployment_id='reseller-turk1' AND actor_id=$1 AND topic IN ('reseller.access_approved','reseller.access_rejected')`, applicant.ID).Scan(&notifications); err != nil {
+		t.Fatal(err)
+	}
+	if status != "pending" || notifications != 0 {
+		t.Fatalf("failed decision left partial state: approval=%s notifications=%d", status, notifications)
 	}
 }
 
