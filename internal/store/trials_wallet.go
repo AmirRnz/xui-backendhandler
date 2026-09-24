@@ -72,8 +72,12 @@ func (s *Store) ClaimTrial(ctx context.Context, a *Actor, planID int64, key stri
 	}
 	var resetDays, unapprovedLimit int
 	var channel string
-	if err = tx.QueryRow(ctx, `SELECT channel,retail_trial_reset_days,unapproved_trial_daily_limit FROM deployments WHERE id=$1`, a.DeploymentID).Scan(&channel, &resetDays, &unapprovedLimit); err != nil {
+	var approvedRequired bool
+	if err = tx.QueryRow(ctx, `SELECT channel,retail_trial_reset_days,unapproved_trial_daily_limit,COALESCE((configuration->>'reseller_approved_required')::boolean,false) FROM deployments WHERE id=$1`, a.DeploymentID).Scan(&channel, &resetDays, &unapprovedLimit, &approvedRequired); err != nil {
 		return nil, err
+	}
+	if channel == "reseller" && approvedRequired && a.ApprovalStatus != "approved" {
+		return nil, ErrForbidden
 	}
 	if len(validInbounds(p.InboundIDs)) == 0 {
 		return nil, fmt.Errorf("test plan has no valid inbound IDs")

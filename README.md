@@ -25,7 +25,9 @@ go run ./cmd/backend serve
 
 Run each Telegram adapter separately with the token for its deployment. The two retail deployments must use separate bot processes and scoped credentials even though they share the same adapter code.
 
-Local plans and actors can be added through the SQL console. Resolve a user's actor once through `/v1/actors/resolve`, then set any required approval/role in the database as an operator. Create plans with explicit `deployment_id`, `panel_id`, `inbound_ids`, integer Toman price fields, expiry/traffic limits, and `is_global`; grant account-specific plans through `plan_access`. Payment card details live on each deployment row. Never put real credentials in this repository.
+Administrators can manage plans, payment instructions, trial settings, reseller approval policy, bot text/features, and the deployment's default panel through `/v1/admin/config`. The Telegram identity `96937669` is migrated as admin only for `retail-finland` and `reseller-turk1`; Germany remains separate. Admin writes are deployment-scoped and audited. The public `/v1/features` endpoint gives bots the corresponding deployment's feature/text configuration.
+
+Panel tokens configured through the admin API are encrypted with AES-256-GCM. Set `BACKEND_PANEL_SECRETS_KEY` to a separately stored base64-encoded 32-byte random key (for example, generate with `openssl rand -base64 32`) in the backend service environment before using panel token updates. Keep the key out of this repository and logs, back it up securely, and retain it across restarts; losing it makes database-stored panel tokens unreadable. Admin GET responses expose only whether a token is configured. Existing environment-provided `XUI_PANEL_TOKENS_JSON` remains supported as a fallback.
 
 ## Importing legacy data
 

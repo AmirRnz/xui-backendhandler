@@ -17,11 +17,12 @@ import (
 )
 
 var (
-	ErrNotFound          = errors.New("not found")
-	ErrForbidden         = errors.New("actor is not authorized for this operation")
-	ErrConflict          = errors.New("request conflicts with existing operation")
-	ErrInsufficientFunds = errors.New("insufficient wallet balance")
-	ErrQuotaExceeded     = errors.New("trial quota exceeded")
+	ErrNotFound           = errors.New("not found")
+	ErrForbidden          = errors.New("actor is not authorized for this operation")
+	ErrConflict           = errors.New("request conflicts with existing operation")
+	ErrInsufficientFunds  = errors.New("insufficient wallet balance")
+	ErrQuotaExceeded      = errors.New("trial quota exceeded")
+	ErrInvalidAdminConfig = errors.New("invalid admin configuration")
 )
 
 type Store struct{ DB *pgxpool.Pool }

@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"example.com/xui-commerce/backend/internal/config"
+	"example.com/xui-commerce/backend/internal/secrets"
 	"example.com/xui-commerce/backend/internal/store"
 	"example.com/xui-commerce/backend/internal/xui"
 )
@@ -49,6 +50,16 @@ func (r *Runner) ProcessOne(ctx context.Context) error {
 		return err
 	}
 	token := r.Config.PanelTokens[w.PanelID]
+	if len(r.Config.PanelSecretsKey) == 32 {
+		ciphertext, secretErr := r.Store.EncryptedPanelToken(ctx, w.PanelID)
+		if secretErr == nil && len(ciphertext) > 0 {
+			plain, openErr := secrets.Open(r.Config.PanelSecretsKey, ciphertext)
+			if openErr != nil {
+				return r.Store.RetryWork(ctx, w.ID, "panel secret could not be decrypted", w.Phase == "ready")
+			}
+			token = string(plain)
+		}
+	}
 	if token == "" {
 		return r.Store.RetryWork(ctx, w.ID, "panel API token is not configured", w.Phase == "ready")
 	}

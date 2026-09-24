@@ -25,6 +25,7 @@ type Handler struct {
 	Store  *store.Store
 	Logger *slog.Logger
 	tokens []config.ClientCredential
+	Config config.Config
 	mux    *http.ServeMux
 }
 type actorView struct {
@@ -35,7 +36,7 @@ type actorView struct {
 }
 
 func New(s *store.Store, c config.Config, logger *slog.Logger) http.Handler {
-	h := &Handler{Store: s, Logger: logger, mux: http.NewServeMux(), tokens: c.ClientCredentials}
+	h := &Handler{Store: s, Logger: logger, mux: http.NewServeMux(), tokens: c.ClientCredentials, Config: c}
 	h.routes()
 	return h.authenticate(h.mux)
 }
@@ -44,6 +45,7 @@ func (h *Handler) routes() {
 	h.mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) { writeJSON(w, 200, map[string]any{"status": "ok"}) })
 	h.mux.HandleFunc("POST /v1/actors/resolve", h.resolveActor)
 	h.mux.HandleFunc("GET /v1/me", h.me)
+	h.mux.HandleFunc("GET /v1/features", h.features)
 	h.mux.HandleFunc("GET /v1/plans", h.plans)
 	h.mux.HandleFunc("POST /v1/quotes", h.quote)
 	h.mux.HandleFunc("POST /v1/purchases", h.purchase)
@@ -61,6 +63,12 @@ func (h *Handler) routes() {
 	h.mux.HandleFunc("POST /v1/payment-intents/{id}/approve", h.approvePayment)
 	h.mux.HandleFunc("GET /v1/admin/payments", h.pendingPayments)
 	h.mux.HandleFunc("GET /v1/admin/work-items", h.workItems)
+	h.mux.HandleFunc("GET /v1/admin/config", h.adminConfig)
+	h.mux.HandleFunc("POST /v1/admin/config/plans", h.adminCreatePlan)
+	h.mux.HandleFunc("PUT /v1/admin/config/plans/{id}", h.adminUpdatePlan)
+	h.mux.HandleFunc("PATCH /v1/admin/config/payment-instructions", h.adminPaymentInstructions)
+	h.mux.HandleFunc("PATCH /v1/admin/config/settings", h.adminSettings)
+	h.mux.HandleFunc("PUT /v1/admin/config/panel", h.adminPanel)
 	h.mux.HandleFunc("GET /v1/admin/refunds", h.pendingRefunds)
 	h.mux.HandleFunc("POST /v1/admin/refunds/{id}/approve", h.approveRefund)
 	h.mux.HandleFunc("GET /v1/payment-instructions", h.paymentInstructions)
@@ -117,6 +125,17 @@ func (h *Handler) me(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, 200, actorView{TelegramID: a.TelegramID, Role: a.Role, ApprovalStatus: a.ApprovalStatus, Channel: a.Channel})
 }
+func (h *Handler) features(w http.ResponseWriter, r *http.Request) {
+	if _, ok := h.actor(w, r); !ok {
+		return
+	}
+	v, err := h.Store.PublicFeatures(r.Context(), principalFrom(r).DeploymentID)
+	if err != nil {
+		h.fail(w, err)
+		return
+	}
+	writeJSON(w, 200, v)
+}
 func (h *Handler) plans(w http.ResponseWriter, r *http.Request) {
 	a, ok := h.actor(w, r)
 	if !ok {
@@ -145,6 +164,9 @@ func (h *Handler) plans(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) quote(w http.ResponseWriter, r *http.Request) {
 	a, ok := h.actor(w, r)
 	if !ok {
+		return
+	}
+	if !h.requireFeature(w, r, "purchases_enabled") {
 		return
 	}
 	var q struct {
@@ -178,6 +200,15 @@ func (h *Handler) purchase(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &q) {
 		return
 	}
+	if !h.requireFeature(w, r, "purchases_enabled") {
+		return
+	}
+	if q.PaymentMethod == "wallet" && !h.requireFeature(w, r, "wallet_enabled") {
+		return
+	}
+	if q.PaymentMethod == "direct" && !h.requireFeature(w, r, "direct_payments_enabled") {
+		return
+	}
 	result, err := h.Store.CreatePurchase(r.Context(), a, q.QuoteID, q.PaymentMethod, q.IdempotencyKey, q.DisplayName)
 	if err != nil {
 		h.fail(w, err)
@@ -188,6 +219,9 @@ func (h *Handler) purchase(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) trial(w http.ResponseWriter, r *http.Request) {
 	a, ok := h.actor(w, r)
 	if !ok {
+		return
+	}
+	if !h.requireFeature(w, r, "trials_enabled") {
 		return
 	}
 	var q struct {
@@ -331,6 +365,9 @@ func (h *Handler) walletLedger(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) createTopup(w http.ResponseWriter, r *http.Request) {
 	a, ok := h.actor(w, r)
 	if !ok {
+		return
+	}
+	if !h.requireFeature(w, r, "topups_enabled") {
 		return
 	}
 	var q struct {
@@ -488,6 +525,18 @@ func (h *Handler) actor(w http.ResponseWriter, r *http.Request) (*store.Actor, b
 		return nil, false
 	}
 	return a, true
+}
+func (h *Handler) requireFeature(w http.ResponseWriter, r *http.Request, key string) bool {
+	enabled, err := h.Store.FeatureEnabled(r.Context(), principalFrom(r).DeploymentID, key)
+	if err != nil {
+		h.fail(w, err)
+		return false
+	}
+	if !enabled {
+		writeError(w, http.StatusConflict, "feature_disabled", "this action is currently unavailable")
+		return false
+	}
+	return true
 }
 func principalFrom(r *http.Request) principal {
 	p, _ := r.Context().Value(contextKey{}).(principal)

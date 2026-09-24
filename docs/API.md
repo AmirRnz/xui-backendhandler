@@ -9,6 +9,7 @@ All routes except `/healthz` require `Authorization: Bearer <deployment-scoped-t
 | `GET /healthz` | none | `{"status":"ok"}`; no client auth |
 | `POST /v1/actors/resolve` | `{"telegram_id":int64}` | Creates or returns only the actor within the credential's deployment |
 | `GET /v1/me` | actor header | Role, approval state, and channel |
+| `GET /v1/features` | actor header | Deployment feature flags and user-facing text; unset feature flags default to enabled |
 | `GET /v1/plans?kind=paid\|test` | actor header | Only enabled plans in this deployment that are global or granted through `plan_access`; panel IDs and inbound IDs are not exposed |
 | `POST /v1/quotes` | `plan_id, months, ip_limit, data_gb, idempotency_key` | Immutable integer-Toman quote with plan/term snapshots; `data_gb:0` means unlimited where the plan permits it |
 | `POST /v1/purchases` | `quote_id, payment_method(wallet\|direct), idempotency_key, display_name` | Creates one order. Wallet purchases debit and queue provisioning atomically; direct purchases create a payment intent and wait for review |
@@ -36,6 +37,14 @@ Admin/operator role is checked in the backend on every call and never inferred b
 | `GET /v1/admin/refunds` | none | Pending refund requests in the deployment |
 | `POST /v1/admin/refunds/{id}/approve` | `amount_toman, audit_note, idempotency_key, manual_override` | Credits only after verified cancellation and within the immutable paid cap, unless an explicit reasoned manual override is recorded |
 | `GET /v1/admin/work-items` | none | Durable work needing operational attention |
+| `GET /v1/admin/config` | admin actor header | Deployment-scoped plan catalog, payment instructions, settings, and panel URL/configured status; never includes a panel token |
+| `POST /v1/admin/config/plans` | full plan object, without `id` | Creates a deployment-owned plan and returns `{id,config}` |
+| `PUT /v1/admin/config/plans/{id}` | full plan object | Updates only a plan owned by this deployment and returns refreshed config |
+| `PATCH /v1/admin/config/payment-instructions` | `card_number, card_owner, instructions` | Replaces this deployment's payment instructions |
+| `PATCH /v1/admin/config/settings` | any subset of `retail_trial_reset_days, unapproved_trial_daily_limit, reseller_approved_required, features, text` | Updates trial controls, reseller approval requirement, feature flags, and user-facing text |
+| `PUT /v1/admin/config/panel` | `base_url, token` | Updates the deployment's default panel. Token is encrypted at rest and never returned; requires `BACKEND_PANEL_SECRETS_KEY` |
+
+Admin configuration writes are scoped to the credential's deployment and recorded in `admin_configuration_audit` without storing secret values. The Telegram ID `96937669` is seeded as the administrator only for `retail-finland` and `reseller-turk1`; it does not gain access to Germany. Feature keys are deployment-specific strings with boolean values. Supported backend gates include `purchases_enabled`, `trials_enabled`, `wallet_enabled`, `topups_enabled`, and `direct_payments_enabled`; missing keys remain enabled.
 
 The backend has no public “set wallet” operation. Financial writes use audited credit/debit ledger entries and bounded idempotency keys. Repeating a key with different input conflicts.
 

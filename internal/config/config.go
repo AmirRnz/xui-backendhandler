@@ -6,6 +6,8 @@ import (
 	"os"
 	"strings"
 	"time"
+
+	"example.com/xui-commerce/backend/internal/secrets"
 )
 
 type ClientCredential struct {
@@ -17,6 +19,7 @@ type Config struct {
 	ListenAddr        string
 	ClientCredentials []ClientCredential
 	PanelTokens       map[string]string
+	PanelSecretsKey   []byte
 	TelegramTokens    map[string]string
 	WorkerInterval    time.Duration
 }
@@ -38,6 +41,13 @@ func Load() (Config, error) {
 		if err := json.Unmarshal([]byte(raw), &c.PanelTokens); err != nil {
 			return c, fmt.Errorf("parse XUI_PANEL_TOKENS_JSON: %w", err)
 		}
+	}
+	if raw := strings.TrimSpace(os.Getenv("BACKEND_PANEL_SECRETS_KEY")); raw != "" {
+		key, err := secrets.ParseKey(raw)
+		if err != nil {
+			return c, err
+		}
+		c.PanelSecretsKey = key
 	}
 	if raw := os.Getenv("TELEGRAM_BOT_TOKENS_JSON"); raw != "" {
 		if err := json.Unmarshal([]byte(raw), &c.TelegramTokens); err != nil {
