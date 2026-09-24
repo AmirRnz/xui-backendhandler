@@ -177,7 +177,7 @@ func (h *Handler) plans(w http.ResponseWriter, r *http.Request) {
 			"price_per_gb_toman": p.PricePerGBToman, "price_per_extra_month_toman": p.PricePerExtraMonthToman,
 			"base_ip_limit": p.BaseIPLimit, "max_ip_limit": p.MaxIPLimit, "min_data_gb": p.MinDataGB,
 			"max_data_bytes": p.MaxDataBytes, "expire_seconds": p.ExpireSeconds, "usage_description": p.UsageDescription,
-			"discount_tiers": p.DiscountTiers}
+			"discount_tiers": p.DiscountTiers, "test_ip_limit": p.IPLimit, "max_per_day": p.MaxPerDay}
 		public = append(public, item)
 	}
 	writeJSON(w, 200, public)

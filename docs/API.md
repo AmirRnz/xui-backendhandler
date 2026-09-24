@@ -11,7 +11,7 @@ All routes except `/healthz` require `Authorization: Bearer <deployment-scoped-t
 | `GET /v1/me` | actor header | Role, approval state, and channel |
 | `POST /v1/reseller/access-requests` | `{}` | A pending reseller can request access; queues one admin notification transactionally. Returns `{"status":"submitted"}` or `{"status":"already_pending","next_request_at":"RFC3339 UTC"}` during the 24-hour per-actor cooldown |
 | `GET /v1/features` | actor header | Deployment feature flags and user-facing text; unset feature flags default to enabled |
-| `GET /v1/plans?kind=paid\|test` | actor header | Only enabled plans in this deployment that are global or granted through `plan_access`; includes the saved description and `discount_tiers` (`months`, integer `basis_points`); panel IDs and inbound IDs are not exposed |
+| `GET /v1/plans?kind=paid\|test` | actor header | Only enabled plans in this deployment that are global or granted through `plan_access`; includes saved descriptions, `discount_tiers` (`months`, integer `basis_points`), and trial policy fields `test_ip_limit`/`max_per_day`; panel IDs and inbound IDs are not exposed |
 | `POST /v1/quotes` | `plan_id, months, ip_limit, data_gb, idempotency_key` | Immutable integer-Toman quote with plan/term snapshots; `data_gb:0` means unlimited where the plan permits it |
 | `POST /v1/purchases` | `quote_id, payment_method(wallet\|direct), idempotency_key, display_name` | Creates one order. Wallet purchases debit and queue provisioning atomically; direct purchases create a payment intent and wait for review |
 | `POST /v1/trials` | `plan_id, idempotency_key` | Reserves one trial and durable provisioning work under the deployment's retail cooldown or reseller UTC quota policy |
