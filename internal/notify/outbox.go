@@ -108,6 +108,12 @@ func formatMessage(topic string, payload any) string {
 		return fmt.Sprintf("اشتراک %s لغو شد.", name)
 	case "refund.approved":
 		return fmt.Sprintf("بازپرداخت به کیف پول شما اضافه شد: %v تومان.", m["amount_toman"])
+	case "payment.rejected":
+		return fmt.Sprintf("رسید پرداخت مستقیم شما به مبلغ %v تومان رد شد. لطفاً رسید را بررسی کرده و در صورت نیاز دوباره ارسال کنید.", m["amount_toman"])
+	case "topup.rejected":
+		return "درخواست افزایش موجودی کیف پول شما رد شد. لطفاً رسید را بررسی کرده و در صورت نیاز درخواست جدید ثبت کنید."
+	case "refund.rejected":
+		return "درخواست استرداد وجه شما توسط مدیریت رد شد."
 	case "reseller.access_requested":
 		telegramID, _ := m["telegram_id"].(float64)
 		requestID, _ := m["request_id"].(float64)

@@ -57,11 +57,15 @@ func (h *Handler) routes() {
 	h.mux.HandleFunc("GET /v1/wallet", h.wallet)
 	h.mux.HandleFunc("GET /v1/wallet/ledger", h.walletLedger)
 	h.mux.HandleFunc("POST /v1/wallet/topups", h.createTopup)
+	h.mux.HandleFunc("GET /v1/wallet/topups/active", h.activeTopup)
 	h.mux.HandleFunc("POST /v1/wallet/topups/{id}/receipt", h.topupReceipt)
 	h.mux.HandleFunc("POST /v1/wallet/topups/{id}/approve", h.approveTopup)
 	h.mux.HandleFunc("GET /v1/admin/topups", h.pendingTopups)
+	h.mux.HandleFunc("POST /v1/admin/topups/{id}/reject", h.rejectTopup)
+	h.mux.HandleFunc("GET /v1/payment-intents/active", h.activePaymentIntent)
 	h.mux.HandleFunc("POST /v1/payment-intents/{id}/receipt", h.paymentReceipt)
 	h.mux.HandleFunc("POST /v1/payment-intents/{id}/approve", h.approvePayment)
+	h.mux.HandleFunc("POST /v1/payment-intents/{id}/reject", h.rejectPayment)
 	h.mux.HandleFunc("GET /v1/admin/payments", h.pendingPayments)
 	h.mux.HandleFunc("GET /v1/admin/work-items", h.workItems)
 	h.mux.HandleFunc("GET /v1/admin/config", h.adminConfig)
@@ -75,6 +79,7 @@ func (h *Handler) routes() {
 	h.mux.HandleFunc("PUT /v1/admin/config/panel", h.adminPanel)
 	h.mux.HandleFunc("GET /v1/admin/refunds", h.pendingRefunds)
 	h.mux.HandleFunc("POST /v1/admin/refunds/{id}/approve", h.approveRefund)
+	h.mux.HandleFunc("POST /v1/admin/refunds/{id}/reject", h.rejectRefund)
 	h.mux.HandleFunc("GET /v1/payment-instructions", h.paymentInstructions)
 }
 
@@ -333,6 +338,28 @@ func (h *Handler) pendingRefunds(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, v)
 }
 
+func (h *Handler) rejectRefund(w http.ResponseWriter, r *http.Request) {
+	a, ok := h.adminActor(w, r)
+	if !ok {
+		return
+	}
+	id, err := pathID(r)
+	if err != nil {
+		h.fail(w, err)
+		return
+	}
+	var q struct{}
+	if !decode(w, r, &q) {
+		return
+	}
+	already, err := h.Store.RejectRefund(r.Context(), a, id)
+	if err != nil {
+		h.fail(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"refund_request_id": id, "status": "rejected", "already_rejected": already})
+}
+
 func (h *Handler) approveRefund(w http.ResponseWriter, r *http.Request) {
 	a, ok := h.adminActor(w, r)
 	if !ok {
@@ -427,6 +454,18 @@ func (h *Handler) topupReceipt(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, 200, map[string]any{"topup_id": id, "status": "receipt_submitted"})
 }
+func (h *Handler) activeTopup(w http.ResponseWriter, r *http.Request) {
+	a, ok := h.actor(w, r)
+	if !ok {
+		return
+	}
+	v, err := h.Store.ActiveTopup(r.Context(), a)
+	if err != nil {
+		h.fail(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"topup": v})
+}
 func (h *Handler) pendingTopups(w http.ResponseWriter, r *http.Request) {
 	a, ok := h.adminActor(w, r)
 	if !ok {
@@ -438,6 +477,27 @@ func (h *Handler) pendingTopups(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, 200, v)
+}
+func (h *Handler) rejectTopup(w http.ResponseWriter, r *http.Request) {
+	a, ok := h.adminActor(w, r)
+	if !ok {
+		return
+	}
+	id, err := pathID(r)
+	if err != nil {
+		h.fail(w, err)
+		return
+	}
+	var q struct{}
+	if !decode(w, r, &q) {
+		return
+	}
+	already, err := h.Store.RejectTopup(r.Context(), a, id)
+	if err != nil {
+		h.fail(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"topup_id": id, "status": "rejected", "already_rejected": already})
 }
 func (h *Handler) approveTopup(w http.ResponseWriter, r *http.Request) {
 	a, ok := h.adminActor(w, r)
@@ -478,6 +538,18 @@ func (h *Handler) paymentReceipt(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, 200, map[string]any{"payment_intent_id": id, "status": "receipt_submitted"})
 }
+func (h *Handler) activePaymentIntent(w http.ResponseWriter, r *http.Request) {
+	a, ok := h.actor(w, r)
+	if !ok {
+		return
+	}
+	v, err := h.Store.ActivePaymentIntent(r.Context(), a)
+	if err != nil {
+		h.fail(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"payment_intent": v})
+}
 func (h *Handler) pendingPayments(w http.ResponseWriter, r *http.Request) {
 	a, ok := h.adminActor(w, r)
 	if !ok {
@@ -489,6 +561,27 @@ func (h *Handler) pendingPayments(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, 200, v)
+}
+func (h *Handler) rejectPayment(w http.ResponseWriter, r *http.Request) {
+	a, ok := h.adminActor(w, r)
+	if !ok {
+		return
+	}
+	id, err := pathID(r)
+	if err != nil {
+		h.fail(w, err)
+		return
+	}
+	var q struct{}
+	if !decode(w, r, &q) {
+		return
+	}
+	already, err := h.Store.RejectPayment(r.Context(), a, id)
+	if err != nil {
+		h.fail(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"payment_intent_id": id, "status": "rejected", "already_rejected": already})
 }
 func (h *Handler) approvePayment(w http.ResponseWriter, r *http.Request) {
 	a, ok := h.adminActor(w, r)

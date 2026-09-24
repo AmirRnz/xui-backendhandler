@@ -109,6 +109,49 @@ func (s *Store) PendingRefunds(ctx context.Context, a *Actor) ([]RefundRequest, 
 	return out, rows.Err()
 }
 
+// RejectRefund closes a pending refund request without restoring a subscription or crediting a wallet.
+func (s *Store) RejectRefund(ctx context.Context, a *Actor, requestID int64) (bool, error) {
+	if !isAdmin(a) || requestID <= 0 {
+		return false, ErrForbidden
+	}
+	tx, err := s.DB.Begin(ctx)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback(ctx)
+	var accountID, requesterID int64
+	var status string
+	err = tx.QueryRow(ctx, `SELECT account_id,actor_id,status FROM refund_requests WHERE id=$1 AND deployment_id=$2 FOR UPDATE`, requestID, a.DeploymentID).Scan(&accountID, &requesterID, &status)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, ErrNotFound
+	}
+	if err != nil {
+		return false, err
+	}
+	if status == "rejected" {
+		if err = tx.Commit(ctx); err != nil {
+			return false, err
+		}
+		return true, nil
+	}
+	if status != "pending" {
+		return false, ErrConflict
+	}
+	if _, err = tx.Exec(ctx, `UPDATE refund_requests SET status='rejected',audit_note='refund request rejected by administrator',updated_at=now() WHERE id=$1`, requestID); err != nil {
+		return false, err
+	}
+	if _, err = tx.Exec(ctx, `INSERT INTO admin_configuration_audit(deployment_id,actor_id,action,subject_ref) VALUES($1,$2,'refund_rejected',$3)`, a.DeploymentID, a.ID, fmt.Sprintf("refund:%d", requestID)); err != nil {
+		return false, err
+	}
+	if _, err = tx.Exec(ctx, `INSERT INTO outbox(deployment_id,account_id,actor_id,dedupe_key,topic,payload) VALUES($1,$2,$3,$4,'refund.rejected','{}'::jsonb) ON CONFLICT(deployment_id,dedupe_key) DO NOTHING`, a.DeploymentID, accountID, requesterID, fmt.Sprintf("refund-rejected:%d", requestID)); err != nil {
+		return false, err
+	}
+	if err = tx.Commit(ctx); err != nil {
+		return false, err
+	}
+	return false, nil
+}
+
 func (s *Store) ApproveRefund(ctx context.Context, a *Actor, requestID, amount int64, auditNote, key string, manualOverride bool) (int64, error) {
 	if !isAdmin(a) || requestID <= 0 || amount <= 0 || !validKey(key) {
 		return 0, ErrForbidden

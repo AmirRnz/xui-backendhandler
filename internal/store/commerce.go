@@ -201,7 +201,7 @@ func (s *Store) PendingPayments(ctx context.Context, a *Actor) ([]map[string]any
 	if !isAdmin(a) {
 		return nil, ErrForbidden
 	}
-	rows, err := s.DB.Query(ctx, `SELECT id,account_id,actor_id,amount_toman,status,created_at FROM payment_intents WHERE deployment_id=$1 AND status='receipt_submitted' ORDER BY created_at`, a.DeploymentID)
+	rows, err := s.DB.Query(ctx, `SELECT id,account_id,actor_id,amount_toman,status,created_at,telegram_file_id FROM payment_intents WHERE deployment_id=$1 AND status='receipt_submitted' ORDER BY created_at`, a.DeploymentID)
 	if err != nil {
 		return nil, err
 	}
@@ -210,13 +210,89 @@ func (s *Store) PendingPayments(ctx context.Context, a *Actor) ([]map[string]any
 	for rows.Next() {
 		var id, account, actor, amount int64
 		var status string
+		var receipt string
 		var at time.Time
-		if err = rows.Scan(&id, &account, &actor, &amount, &status, &at); err != nil {
+		if err = rows.Scan(&id, &account, &actor, &amount, &status, &at, &receipt); err != nil {
 			return nil, err
 		}
-		out = append(out, map[string]any{"id": id, "account_id": account, "actor_id": actor, "amount_toman": amount, "status": status, "created_at": at})
+		out = append(out, map[string]any{"id": id, "account_id": account, "actor_id": actor, "amount_toman": amount, "status": status, "created_at": at, "telegram_file_id": receipt})
 	}
 	return out, rows.Err()
+}
+
+// ActivePaymentIntent returns only the current actor's resumable direct-payment request.
+func (s *Store) ActivePaymentIntent(ctx context.Context, a *Actor) (map[string]any, error) {
+	if a == nil || !a.Enabled {
+		return nil, ErrForbidden
+	}
+	var id, amount int64
+	var status string
+	var created time.Time
+	err := s.DB.QueryRow(ctx, `SELECT id,amount_toman,status,created_at FROM payment_intents
+		WHERE deployment_id=$1 AND account_id=$2 AND actor_id=$3 AND status IN ('awaiting_receipt','receipt_submitted')
+		ORDER BY created_at DESC LIMIT 1`, a.DeploymentID, a.AccountID, a.ID).Scan(&id, &amount, &status, &created)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return map[string]any{"id": id, "status": status, "amount_toman": amount, "created_at": created}, nil
+}
+
+// RejectPayment closes an unpaid order and records one audited decision. It never settles or provisions it.
+func (s *Store) RejectPayment(ctx context.Context, a *Actor, intentID int64) (bool, error) {
+	if !isAdmin(a) || intentID <= 0 {
+		return false, ErrForbidden
+	}
+	tx, err := s.DB.Begin(ctx)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback(ctx)
+	var accountID, requesterID, orderID int64
+	var amount int64
+	var status, orderStatus string
+	err = tx.QueryRow(ctx, `SELECT p.account_id,p.actor_id,p.amount_toman,p.status,o.id,o.status FROM payment_intents p JOIN orders o ON o.payment_intent_id=p.id
+		WHERE p.id=$1 AND p.deployment_id=$2 FOR UPDATE OF p,o`, intentID, a.DeploymentID).Scan(&accountID, &requesterID, &amount, &status, &orderID, &orderStatus)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, ErrNotFound
+	}
+	if err != nil {
+		return false, err
+	}
+	if status == "rejected" {
+		if err = tx.Commit(ctx); err != nil {
+			return false, err
+		}
+		return true, nil
+	}
+	if status != "receipt_submitted" {
+		return false, ErrConflict
+	}
+	if orderStatus != "awaiting_payment" {
+		return false, ErrConflict
+	}
+	if _, err = tx.Exec(ctx, `UPDATE payment_intents SET status='rejected',reviewed_by=$1,review_note='receipt rejected by administrator',updated_at=now() WHERE id=$2`, a.ID, intentID); err != nil {
+		return false, err
+	}
+	orderTag, err := tx.Exec(ctx, `UPDATE orders SET status='cancelled',updated_at=now() WHERE id=$1 AND status='awaiting_payment'`, orderID)
+	if err != nil {
+		return false, err
+	}
+	if orderTag.RowsAffected() != 1 {
+		return false, ErrConflict
+	}
+	if _, err = tx.Exec(ctx, `INSERT INTO admin_configuration_audit(deployment_id,actor_id,action,subject_ref) VALUES($1,$2,'payment_rejected',$3)`, a.DeploymentID, a.ID, fmt.Sprintf("payment_intent:%d", intentID)); err != nil {
+		return false, err
+	}
+	if _, err = tx.Exec(ctx, `INSERT INTO outbox(deployment_id,account_id,actor_id,dedupe_key,topic,payload) VALUES($1,$2,$3,$4,'payment.rejected',jsonb_build_object('amount_toman',$5::bigint)) ON CONFLICT(deployment_id,dedupe_key) DO NOTHING`, a.DeploymentID, accountID, requesterID, fmt.Sprintf("payment-rejected:%d", intentID), amount); err != nil {
+		return false, err
+	}
+	if err = tx.Commit(ctx); err != nil {
+		return false, err
+	}
+	return false, nil
 }
 
 func (s *Store) ApprovePayment(ctx context.Context, a *Actor, intentID int64) (*PurchaseResult, error) {

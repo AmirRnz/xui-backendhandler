@@ -245,7 +245,7 @@ func (s *Store) PendingTopups(ctx context.Context, a *Actor) ([]map[string]any, 
 	if !isAdmin(a) {
 		return nil, ErrForbidden
 	}
-	rows, err := s.DB.Query(ctx, `SELECT id,account_id,actor_id,amount_toman,status,created_at FROM topup_requests WHERE deployment_id=$1 AND status='receipt_submitted' ORDER BY created_at`, a.DeploymentID)
+	rows, err := s.DB.Query(ctx, `SELECT id,account_id,actor_id,amount_toman,status,created_at,telegram_file_id FROM topup_requests WHERE deployment_id=$1 AND status='receipt_submitted' ORDER BY created_at`, a.DeploymentID)
 	if err != nil {
 		return nil, err
 	}
@@ -254,13 +254,77 @@ func (s *Store) PendingTopups(ctx context.Context, a *Actor) ([]map[string]any, 
 	for rows.Next() {
 		var id, account, actor, amount int64
 		var status string
+		var receipt string
 		var at time.Time
-		if err = rows.Scan(&id, &account, &actor, &amount, &status, &at); err != nil {
+		if err = rows.Scan(&id, &account, &actor, &amount, &status, &at, &receipt); err != nil {
 			return nil, err
 		}
-		out = append(out, map[string]any{"id": id, "account_id": account, "actor_id": actor, "amount_toman": amount, "status": status, "created_at": at})
+		out = append(out, map[string]any{"id": id, "account_id": account, "actor_id": actor, "amount_toman": amount, "status": status, "created_at": at, "telegram_file_id": receipt})
 	}
 	return out, rows.Err()
+}
+
+// ActiveTopup returns only the current actor's resumable wallet top-up request.
+func (s *Store) ActiveTopup(ctx context.Context, a *Actor) (map[string]any, error) {
+	if a == nil || !a.Enabled {
+		return nil, ErrForbidden
+	}
+	var id, amount int64
+	var status string
+	var created time.Time
+	err := s.DB.QueryRow(ctx, `SELECT id,amount_toman,status,created_at FROM topup_requests
+		WHERE deployment_id=$1 AND account_id=$2 AND actor_id=$3 AND status IN ('awaiting_receipt','receipt_submitted')
+		ORDER BY created_at DESC LIMIT 1`, a.DeploymentID, a.AccountID, a.ID).Scan(&id, &amount, &status, &created)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return map[string]any{"id": id, "status": status, "amount_toman": amount, "created_at": created}, nil
+}
+
+// RejectTopup records one audited decision without creating a wallet credit.
+func (s *Store) RejectTopup(ctx context.Context, a *Actor, topupID int64) (bool, error) {
+	if !isAdmin(a) || topupID <= 0 {
+		return false, ErrForbidden
+	}
+	tx, err := s.DB.Begin(ctx)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback(ctx)
+	var accountID, requesterID int64
+	var status string
+	err = tx.QueryRow(ctx, `SELECT account_id,actor_id,status FROM topup_requests WHERE id=$1 AND deployment_id=$2 FOR UPDATE`, topupID, a.DeploymentID).Scan(&accountID, &requesterID, &status)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, ErrNotFound
+	}
+	if err != nil {
+		return false, err
+	}
+	if status == "rejected" {
+		if err = tx.Commit(ctx); err != nil {
+			return false, err
+		}
+		return true, nil
+	}
+	if status != "receipt_submitted" {
+		return false, ErrConflict
+	}
+	if _, err = tx.Exec(ctx, `UPDATE topup_requests SET status='rejected',reviewed_by=$1,review_note='receipt rejected by administrator',updated_at=now() WHERE id=$2`, a.ID, topupID); err != nil {
+		return false, err
+	}
+	if _, err = tx.Exec(ctx, `INSERT INTO admin_configuration_audit(deployment_id,actor_id,action,subject_ref) VALUES($1,$2,'topup_rejected',$3)`, a.DeploymentID, a.ID, fmt.Sprintf("topup:%d", topupID)); err != nil {
+		return false, err
+	}
+	if _, err = tx.Exec(ctx, `INSERT INTO outbox(deployment_id,account_id,actor_id,dedupe_key,topic,payload) VALUES($1,$2,$3,$4,'topup.rejected','{}'::jsonb) ON CONFLICT(deployment_id,dedupe_key) DO NOTHING`, a.DeploymentID, accountID, requesterID, fmt.Sprintf("topup-rejected:%d", topupID)); err != nil {
+		return false, err
+	}
+	if err = tx.Commit(ctx); err != nil {
+		return false, err
+	}
+	return false, nil
 }
 
 func (s *Store) ApproveTopup(ctx context.Context, a *Actor, topupID int64) (int64, error) {
