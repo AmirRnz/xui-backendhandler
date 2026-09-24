@@ -49,7 +49,7 @@ func TestPaymentRejectIsAuditedIdempotentAndResumeIsActorScoped(t *testing.T) {
 	}
 	admin := resolve(t, s, "retail-finland", 96937669)
 	pending, err := s.PendingPayments(ctx, admin)
-	if err != nil || len(pending) != 1 || pending[0]["telegram_file_id"] != "tg-file-receipt-secret" {
+	if err != nil || len(pending) != 1 || pending[0]["telegram_file_id"] != "tg-file-receipt-secret" || pending[0]["telegram_id"] != int64(86101) {
 		t.Fatalf("admin receipt evidence=%v err=%v", pending, err)
 	}
 	var wg sync.WaitGroup
@@ -107,7 +107,7 @@ func TestTopupRejectHasNoCreditAndAdminReceiptOnly(t *testing.T) {
 		t.Fatalf("active topup=%v err=%v", resume, err)
 	}
 	pending, err := s.PendingTopups(ctx, admin)
-	if err != nil || len(pending) != 1 || pending[0]["telegram_file_id"] != "tg-topup-evidence" {
+	if err != nil || len(pending) != 1 || pending[0]["telegram_file_id"] != "tg-topup-evidence" || pending[0]["telegram_id"] != int64(86201) {
 		t.Fatalf("admin topup evidence=%v err=%v", pending, err)
 	}
 	if _, err = s.PendingTopups(ctx, customer); !errors.Is(err, store.ErrForbidden) {
@@ -210,6 +210,91 @@ func TestAdminReceiptEndpointsRejectRegularActor(t *testing.T) {
 		h.ServeHTTP(res, req)
 		if res.Code != http.StatusForbidden {
 			t.Fatalf("regular actor accessed %s: %d %s", path, res.Code, res.Body.String())
+		}
+	}
+}
+
+func TestPendingEvidenceTelegramIDsAreAdminOnlyAndDeploymentScoped(t *testing.T) {
+	s, _ := testStore(t)
+	ctx := context.Background()
+	finlandCustomer := resolve(t, s, "retail-finland", 86601)
+	resellerCustomer := resolve(t, s, "reseller-turk1", 86602)
+	finlandAdmin := resolve(t, s, "retail-finland", 96937669)
+	resellerAdmin := resolve(t, s, "reseller-turk1", 96937669)
+
+	for _, item := range []struct {
+		deployment string
+		actor      *store.Actor
+		key        string
+		file       string
+	}{
+		{"retail-finland", finlandCustomer, "pending-finland", "receipt-finland"},
+		{"reseller-turk1", resellerCustomer, "pending-reseller", "receipt-reseller"},
+	} {
+		planID := addPlan(t, s, item.deployment, "paid", item.key, 5000, 0)
+		q, err := s.CreateQuote(ctx, item.actor, planID, 1, 1, 0, item.key+"-quote")
+		if err != nil {
+			t.Fatal(err)
+		}
+		purchase, err := s.CreatePurchase(ctx, item.actor, q.ID, "direct", item.key+"-purchase", "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err = s.SubmitReceipt(ctx, item.actor, purchase.PaymentIntentID, item.file); err != nil {
+			t.Fatal(err)
+		}
+		topupID, err := s.CreateTopup(ctx, item.actor, 7000, item.key+"-topup")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err = s.SubmitTopupReceipt(ctx, item.actor, topupID, item.file+"-topup"); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	const finlandToken = "finland-pending-evidence-token-000000000000"
+	const resellerToken = "reseller-pending-evidence-token-000000000000"
+	h := api.New(s, config.Config{ClientCredentials: []config.ClientCredential{
+		{DeploymentID: "retail-finland", Token: finlandToken},
+		{DeploymentID: "reseller-turk1", Token: resellerToken},
+	}}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	get := func(token string, actorID int64, path string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		req.Header.Set("Authorization", "Bearer "+token)
+		req.Header.Set("X-Actor-Telegram-ID", strconv.FormatInt(actorID, 10))
+		res := httptest.NewRecorder()
+		h.ServeHTTP(res, req)
+		return res
+	}
+	type pendingResponse struct {
+		TelegramID int64 `json:"telegram_id"`
+	}
+	for _, tc := range []struct {
+		deployment, token string
+		adminTelegramID   int64
+		wantTelegramID    int64
+	}{
+		{"retail-finland", finlandToken, finlandAdmin.TelegramID, 86601},
+		{"reseller-turk1", resellerToken, resellerAdmin.TelegramID, 86602},
+	} {
+		for _, path := range []string{"/v1/admin/payments", "/v1/admin/topups"} {
+			response := get(tc.token, tc.adminTelegramID, path)
+			if response.Code != http.StatusOK {
+				t.Fatalf("%s %s status=%d body=%s", tc.deployment, path, response.Code, response.Body.String())
+			}
+			var rows []pendingResponse
+			if err := json.Unmarshal(response.Body.Bytes(), &rows); err != nil {
+				t.Fatal(err)
+			}
+			if len(rows) != 1 || rows[0].TelegramID != tc.wantTelegramID {
+				t.Fatalf("%s %s returned cross-tenant or missing applicant identity: %+v", tc.deployment, path, rows)
+			}
+		}
+	}
+	for _, path := range []string{"/v1/admin/payments", "/v1/admin/topups"} {
+		response := get(finlandToken, 86601, path)
+		if response.Code != http.StatusForbidden {
+			t.Fatalf("regular actor accessed %s: status=%d body=%s", path, response.Code, response.Body.String())
 		}
 	}
 }

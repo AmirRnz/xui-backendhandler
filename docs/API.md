@@ -21,8 +21,10 @@ All routes except `/healthz` require `Authorization: Bearer <deployment-scoped-t
 | `GET /v1/wallet` | actor header | Current Toman balance |
 | `GET /v1/wallet/ledger` | actor header | Audited, account-scoped ledger entries |
 | `POST /v1/wallet/topups` | `amount_toman, idempotency_key` | Creates one top-up request; amounts below a configured positive `min_topup_toman` are rejected with HTTP 400 |
+| `GET /v1/wallet/topups/active` | actor header | Returns `{topup:null}` or the actor's latest top-up awaiting a receipt or review; receipt file IDs are not returned |
 | `POST /v1/wallet/topups/{id}/receipt` | `telegram_file_id` | Submits a receipt for the owned request |
 | `POST /v1/payment-intents/{id}/receipt` | `telegram_file_id` | Submits a receipt for the owned payment intent |
+| `GET /v1/payment-intents/active` | actor header | Returns `{payment_intent:null}` or the actor's latest direct payment awaiting a receipt or review; receipt file IDs are not returned |
 | `GET /v1/payment-instructions` | actor header | Deployment-specific instructions with `min_topup_toman`; zero means no configured minimum |
 
 ## Admin operations
@@ -31,12 +33,15 @@ The designated admin identity and deployment scope are checked in the backend on
 
 | Method and path | Request | Result |
 |---|---|---|
-| `GET /v1/admin/payments` | none | Receipt-submitted payment intents in the deployment |
+| `GET /v1/admin/payments` | none | Receipt-submitted payment intents in the deployment, including applicant `telegram_id` and `telegram_file_id` for receipt review |
 | `POST /v1/payment-intents/{id}/approve` | empty object | Approves the immutable amount once, writes settlement and durable provisioning work |
-| `GET /v1/admin/topups` | none | Receipt-submitted wallet top-ups in the deployment |
+| `POST /v1/payment-intents/{id}/reject` | empty object | Rejects a receipt-submitted payment and cancels its unpaid order without settlement or provisioning; replay returns `already_rejected: true` |
+| `GET /v1/admin/topups` | none | Receipt-submitted wallet top-ups in the deployment, including applicant `telegram_id` and `telegram_file_id` for receipt review |
 | `POST /v1/wallet/topups/{id}/approve` | empty object | Credits the wallet once with an audit ledger entry |
+| `POST /v1/admin/topups/{id}/reject` | empty object | Rejects a receipt-submitted top-up without crediting the wallet; replay returns `already_rejected: true` |
 | `GET /v1/admin/refunds` | none | Pending refund requests in the deployment |
 | `POST /v1/admin/refunds/{id}/approve` | `amount_toman, audit_note, idempotency_key, manual_override` | Credits only after verified cancellation and within the immutable paid cap, unless an explicit reasoned manual override is recorded |
+| `POST /v1/admin/refunds/{id}/reject` | empty object | Rejects a pending refund without restoring a subscription or crediting the wallet; replay returns `already_rejected: true` |
 | `GET /v1/admin/work-items` | none | Durable work needing operational attention |
 | `GET /v1/admin/config` | admin actor header | Deployment-scoped plan catalog, payment instructions, settings, and panel URL/configured status; never includes a panel token |
 | `GET /v1/admin/resellers/pending` | admin actor header | Pending reseller accounts in this reseller deployment only |

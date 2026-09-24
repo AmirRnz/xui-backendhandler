@@ -201,21 +201,23 @@ func (s *Store) PendingPayments(ctx context.Context, a *Actor) ([]map[string]any
 	if !isAdmin(a) {
 		return nil, ErrForbidden
 	}
-	rows, err := s.DB.Query(ctx, `SELECT id,account_id,actor_id,amount_toman,status,created_at,telegram_file_id FROM payment_intents WHERE deployment_id=$1 AND status='receipt_submitted' ORDER BY created_at`, a.DeploymentID)
+	rows, err := s.DB.Query(ctx, `SELECT p.id,p.account_id,p.actor_id,COALESCE(actor.telegram_id,0),p.amount_toman,p.status,p.created_at,p.telegram_file_id
+		FROM payment_intents p LEFT JOIN actors actor ON actor.id=p.actor_id AND actor.deployment_id=p.deployment_id AND actor.account_id=p.account_id
+		WHERE p.deployment_id=$1 AND p.status='receipt_submitted' ORDER BY p.created_at`, a.DeploymentID)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 	out := []map[string]any{}
 	for rows.Next() {
-		var id, account, actor, amount int64
+		var id, account, actor, telegramID, amount int64
 		var status string
 		var receipt string
 		var at time.Time
-		if err = rows.Scan(&id, &account, &actor, &amount, &status, &at, &receipt); err != nil {
+		if err = rows.Scan(&id, &account, &actor, &telegramID, &amount, &status, &at, &receipt); err != nil {
 			return nil, err
 		}
-		out = append(out, map[string]any{"id": id, "account_id": account, "actor_id": actor, "amount_toman": amount, "status": status, "created_at": at, "telegram_file_id": receipt})
+		out = append(out, map[string]any{"id": id, "account_id": account, "actor_id": actor, "telegram_id": telegramID, "amount_toman": amount, "status": status, "created_at": at, "telegram_file_id": receipt})
 	}
 	return out, rows.Err()
 }
