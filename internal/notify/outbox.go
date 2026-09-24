@@ -108,6 +108,10 @@ func formatMessage(topic string, payload any) string {
 		return fmt.Sprintf("اشتراک %s لغو شد.", name)
 	case "refund.approved":
 		return fmt.Sprintf("بازپرداخت به کیف پول شما اضافه شد: %v تومان.", m["amount_toman"])
+	case "reseller.access_requested":
+		telegramID, _ := m["telegram_id"].(float64)
+		requestID, _ := m["request_id"].(float64)
+		return fmt.Sprintf("درخواست دسترسی نمایندگی جدید:\nآیدی تلگرام: %.0f\nشناسه درخواست: %.0f\nبرای بررسی، منوی درخواست‌های reseller را باز کنید.", telegramID, requestID)
 	default:
 		if status != "" {
 			return fmt.Sprintf("وضعیت درخواست %s: %s", name, status)

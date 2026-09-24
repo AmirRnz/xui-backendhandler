@@ -45,6 +45,7 @@ func (h *Handler) routes() {
 	h.mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) { writeJSON(w, 200, map[string]any{"status": "ok"}) })
 	h.mux.HandleFunc("POST /v1/actors/resolve", h.resolveActor)
 	h.mux.HandleFunc("GET /v1/me", h.me)
+	h.mux.HandleFunc("POST /v1/reseller/access-requests", h.requestResellerAccess)
 	h.mux.HandleFunc("GET /v1/features", h.features)
 	h.mux.HandleFunc("GET /v1/plans", h.plans)
 	h.mux.HandleFunc("POST /v1/quotes", h.quote)
@@ -127,6 +128,22 @@ func (h *Handler) me(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, 200, actorView{TelegramID: a.TelegramID, Role: a.Role, ApprovalStatus: a.ApprovalStatus, Channel: a.Channel})
+}
+func (h *Handler) requestResellerAccess(w http.ResponseWriter, r *http.Request) {
+	a, ok := h.actor(w, r)
+	if !ok {
+		return
+	}
+	var empty struct{}
+	if !decode(w, r, &empty) {
+		return
+	}
+	result, err := h.Store.RequestResellerAccess(r.Context(), a)
+	if err != nil {
+		h.fail(w, err)
+		return
+	}
+	writeJSON(w, http.StatusAccepted, result)
 }
 func (h *Handler) features(w http.ResponseWriter, r *http.Request) {
 	if _, ok := h.actor(w, r); !ok {
