@@ -146,7 +146,7 @@ func (s *Store) SaveAdminPlan(ctx context.Context, deployment string, actorID in
 		if err != nil {
 			return 0, err
 		}
-		if err = recordAdminAudit(ctx, tx, deployment, actorID, "plan_created"); err != nil {
+		if err = recordAdminAudit(ctx, tx, deployment, actorID, "plan_created", fmt.Sprintf("plan:%d", p.ID)); err != nil {
 			return 0, err
 		}
 		if err = tx.Commit(ctx); err != nil {
@@ -163,7 +163,7 @@ func (s *Store) SaveAdminPlan(ctx context.Context, deployment string, actorID in
 	if tag.RowsAffected() == 0 {
 		return 0, pgx.ErrNoRows
 	}
-	if err = recordAdminAudit(ctx, tx, deployment, actorID, "plan_updated"); err != nil {
+	if err = recordAdminAudit(ctx, tx, deployment, actorID, "plan_updated", fmt.Sprintf("plan:%d", p.ID)); err != nil {
 		return 0, err
 	}
 	if err = tx.Commit(ctx); err != nil {
@@ -188,7 +188,7 @@ func (s *Store) SavePaymentInstructions(ctx context.Context, deployment string, 
 	if tag.RowsAffected() == 0 {
 		return pgx.ErrNoRows
 	}
-	if err = recordAdminAudit(ctx, tx, deployment, actorID, "payment_instructions_updated"); err != nil {
+	if err = recordAdminAudit(ctx, tx, deployment, actorID, "payment_instructions_updated", ""); err != nil {
 		return err
 	}
 	return tx.Commit(ctx)
@@ -239,7 +239,7 @@ func (s *Store) PatchAdminSettings(ctx context.Context, deployment string, actor
 	if _, err = tx.Exec(ctx, `UPDATE deployments SET retail_trial_reset_days=COALESCE($2,retail_trial_reset_days),unapproved_trial_daily_limit=COALESCE($3,unapproved_trial_daily_limit),configuration=$4::jsonb WHERE id=$1`, deployment, resetDays, unapprovedLimit, encoded); err != nil {
 		return err
 	}
-	if err = recordAdminAudit(ctx, tx, deployment, actorID, "settings_updated"); err != nil {
+	if err = recordAdminAudit(ctx, tx, deployment, actorID, "settings_updated", ""); err != nil {
 		return err
 	}
 	return tx.Commit(ctx)
@@ -294,7 +294,7 @@ func (s *Store) SavePanelConfig(ctx context.Context, deployment string, actorID 
 	if tag.RowsAffected() == 0 {
 		return pgx.ErrNoRows
 	}
-	if err = recordAdminAudit(ctx, tx, deployment, actorID, "panel_config_updated"); err != nil {
+	if err = recordAdminAudit(ctx, tx, deployment, actorID, "panel_config_updated", ""); err != nil {
 		return err
 	}
 	return tx.Commit(ctx)
@@ -382,7 +382,7 @@ func (s *Store) SetResellerApproval(ctx context.Context, deployment string, admi
 	if tag.RowsAffected() != 1 {
 		return nil, ErrConflict
 	}
-	if err = recordAdminAudit(ctx, tx, deployment, adminID, "reseller_"+status); err != nil {
+	if err = recordAdminAudit(ctx, tx, deployment, adminID, "reseller_"+status, fmt.Sprintf("telegram:%d", telegramID)); err != nil {
 		return nil, err
 	}
 	if err = tx.Commit(ctx); err != nil {
@@ -401,9 +401,9 @@ func validateResellerDecision(current, target string) error {
 	return nil
 }
 
-func recordAdminAudit(ctx context.Context, tx pgx.Tx, deployment string, actorID int64, action string) error {
-	tag, err := tx.Exec(ctx, `INSERT INTO admin_configuration_audit(deployment_id,actor_id,action)
-		SELECT $1,id,$3 FROM actors WHERE id=$2 AND deployment_id=$1 AND deployment_id IN ('retail-finland','reseller-turk1') AND telegram_id=96937669 AND role='admin' AND enabled AND approval_status='approved'`, deployment, actorID, action)
+func recordAdminAudit(ctx context.Context, tx pgx.Tx, deployment string, actorID int64, action, subjectRef string) error {
+	tag, err := tx.Exec(ctx, `INSERT INTO admin_configuration_audit(deployment_id,actor_id,action,subject_ref)
+		SELECT $1,id,$3,$4 FROM actors WHERE id=$2 AND deployment_id=$1 AND deployment_id IN ('retail-finland','reseller-turk1') AND telegram_id=96937669 AND role='admin' AND enabled AND approval_status='approved'`, deployment, actorID, action, subjectRef)
 	if err != nil {
 		return err
 	}

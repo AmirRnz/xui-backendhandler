@@ -13,6 +13,7 @@ CREATE TABLE IF NOT EXISTS admin_configuration_audit (
   deployment_id TEXT NOT NULL REFERENCES deployments(id),
   actor_id BIGINT NOT NULL REFERENCES actors(id),
   action TEXT NOT NULL,
+  subject_ref TEXT NOT NULL DEFAULT '',
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS admin_configuration_audit_recent_idx

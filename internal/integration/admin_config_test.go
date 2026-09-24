@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -67,6 +68,19 @@ func TestAdminConfigIsDeploymentScopedAndSecretsAreWriteOnly(t *testing.T) {
 	created := request(http.MethodPost, "/v1/admin/config/plans", finToken, "96937669", plan)
 	if created.Code != http.StatusCreated {
 		t.Fatalf("plan create status=%d body=%s", created.Code, created.Body.String())
+	}
+	var createdPlan struct {
+		ID int64 `json:"id"`
+	}
+	if err := json.Unmarshal(created.Body.Bytes(), &createdPlan); err != nil {
+		t.Fatal(err)
+	}
+	var planAudits int
+	if err := s.DB.QueryRow(ctx, `SELECT count(*) FROM admin_configuration_audit WHERE deployment_id='retail-finland' AND action='plan_created' AND subject_ref=$1`, fmt.Sprintf("plan:%d", createdPlan.ID)).Scan(&planAudits); err != nil {
+		t.Fatal(err)
+	}
+	if planAudits != 1 {
+		t.Fatalf("created plan audit subject missing: %d", planAudits)
 	}
 	if rec := request(http.MethodPatch, "/v1/admin/config/payment-instructions", finToken, "96937669", `{"card_number":"1111","card_owner":"Example","instructions":"Pay here"}`); rec.Code != 200 {
 		t.Fatalf("payment update status=%d body=%s", rec.Code, rec.Body.String())
@@ -165,11 +179,18 @@ func TestResellerReviewIsDeploymentScopedAndAuditedAtomically(t *testing.T) {
 		t.Fatalf("concurrent review was not a single pending transition: success=%d conflicts=%d", successes, conflicts)
 	}
 	var reviews int
-	if err := s.DB.QueryRow(ctx, `SELECT count(*) FROM admin_configuration_audit WHERE deployment_id='reseller-turk1' AND actor_id=$1 AND action IN ('reseller_approved','reseller_rejected')`, admin.ID).Scan(&reviews); err != nil {
+	if err := s.DB.QueryRow(ctx, `SELECT count(*) FROM admin_configuration_audit WHERE deployment_id='reseller-turk1' AND actor_id=$1 AND action='reseller_approved' AND subject_ref='telegram:97654321'`, admin.ID).Scan(&reviews); err != nil {
 		t.Fatal(err)
 	}
-	if reviews != 2 {
-		t.Fatalf("expected one audit per winning review transition, got %d", reviews)
+	if reviews != 1 {
+		t.Fatalf("approved reseller audit subject missing: %d", reviews)
+	}
+	var concurrentAudits int
+	if err := s.DB.QueryRow(ctx, `SELECT count(*) FROM admin_configuration_audit WHERE deployment_id='reseller-turk1' AND actor_id=$1 AND action IN ('reseller_approved','reseller_rejected') AND subject_ref='telegram:97654322'`, admin.ID).Scan(&concurrentAudits); err != nil {
+		t.Fatal(err)
+	}
+	if concurrentAudits != 1 {
+		t.Fatalf("concurrent winning review should produce exactly one target audit row, got %d", concurrentAudits)
 	}
 	if err := s.SavePaymentInstructions(ctx, "retail-finland", 0, "should-rollback", "", ""); err == nil {
 		t.Fatal("configuration change with invalid admin actor unexpectedly succeeded")
