@@ -170,6 +170,7 @@ func (h *Handler) adminSettings(w http.ResponseWriter, r *http.Request) {
 	var q struct {
 		RetailTrialResetDays      *int           `json:"retail_trial_reset_days"`
 		UnapprovedTrialDailyLimit *int           `json:"unapproved_trial_daily_limit"`
+		MinTopupToman             *int64         `json:"min_topup_toman"`
 		ResellerApprovedRequired  *bool          `json:"reseller_approved_required"`
 		Features                  map[string]any `json:"features"`
 		Text                      map[string]any `json:"text"`
@@ -177,11 +178,11 @@ func (h *Handler) adminSettings(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &q) {
 		return
 	}
-	if q.RetailTrialResetDays == nil && q.UnapprovedTrialDailyLimit == nil && q.ResellerApprovedRequired == nil && q.Features == nil && q.Text == nil {
+	if q.RetailTrialResetDays == nil && q.UnapprovedTrialDailyLimit == nil && q.MinTopupToman == nil && q.ResellerApprovedRequired == nil && q.Features == nil && q.Text == nil {
 		writeError(w, 400, "invalid_request", "at least one setting is required")
 		return
 	}
-	if err := h.Store.PatchAdminSettings(r.Context(), principalFrom(r).DeploymentID, a.ID, q.RetailTrialResetDays, q.UnapprovedTrialDailyLimit, q.ResellerApprovedRequired, q.Features, q.Text); err != nil {
+	if err := h.Store.PatchAdminSettings(r.Context(), principalFrom(r).DeploymentID, a.ID, q.RetailTrialResetDays, q.UnapprovedTrialDailyLimit, q.MinTopupToman, q.ResellerApprovedRequired, q.Features, q.Text); err != nil {
 		h.adminConfigFail(w, err)
 		return
 	}

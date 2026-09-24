@@ -17,6 +17,7 @@ type DiscountTier struct {
 type Plan struct {
 	ID                      int64          `json:"id"`
 	Name                    string         `json:"name"`
+	Description             string         `json:"description"`
 	Kind                    string         `json:"kind"`
 	Enabled                 bool           `json:"enabled"`
 	IsLimited               bool           `json:"is_limited"`

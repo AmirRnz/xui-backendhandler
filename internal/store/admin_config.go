@@ -7,32 +7,34 @@ import (
 	"strings"
 	"time"
 
+	"example.com/xui-commerce/backend/internal/commerce"
 	"github.com/jackc/pgx/v5"
 
 	"example.com/xui-commerce/backend/internal/panelurl"
 )
 
 type AdminPlan struct {
-	ID                      int64  `json:"id"`
-	Name                    string `json:"name"`
-	Kind                    string `json:"kind"`
-	Enabled                 bool   `json:"enabled"`
-	IsLimited               bool   `json:"is_limited"`
-	Description             string `json:"description"`
-	BasePriceToman          int64  `json:"base_price_toman"`
-	PricePerExtraIPToman    int64  `json:"price_per_extra_ip_toman"`
-	PricePerGBToman         int64  `json:"price_per_gb_toman"`
-	PricePerExtraMonthToman int64  `json:"price_per_extra_month_toman"`
-	BaseIPLimit             int    `json:"base_ip_limit"`
-	MaxIPLimit              int    `json:"max_ip_limit"`
-	MinDataGB               int    `json:"min_data_gb"`
-	MaxDataBytes            int64  `json:"max_data_bytes"`
-	ExpireSeconds           int64  `json:"expire_seconds"`
-	TestIPLimit             int    `json:"test_ip_limit"`
-	MaxPerDay               int    `json:"max_per_day"`
-	Flow                    string `json:"flow"`
-	InboundIDs              []int  `json:"inbound_ids"`
-	UsageDescription        string `json:"usage_description"`
+	ID                      int64                   `json:"id"`
+	Name                    string                  `json:"name"`
+	Kind                    string                  `json:"kind"`
+	Enabled                 bool                    `json:"enabled"`
+	IsLimited               bool                    `json:"is_limited"`
+	Description             string                  `json:"description"`
+	BasePriceToman          int64                   `json:"base_price_toman"`
+	PricePerExtraIPToman    int64                   `json:"price_per_extra_ip_toman"`
+	PricePerGBToman         int64                   `json:"price_per_gb_toman"`
+	PricePerExtraMonthToman int64                   `json:"price_per_extra_month_toman"`
+	BaseIPLimit             int                     `json:"base_ip_limit"`
+	MaxIPLimit              int                     `json:"max_ip_limit"`
+	MinDataGB               int                     `json:"min_data_gb"`
+	MaxDataBytes            int64                   `json:"max_data_bytes"`
+	ExpireSeconds           int64                   `json:"expire_seconds"`
+	TestIPLimit             int                     `json:"test_ip_limit"`
+	MaxPerDay               int                     `json:"max_per_day"`
+	Flow                    string                  `json:"flow"`
+	InboundIDs              []int                   `json:"inbound_ids"`
+	DiscountTiers           []commerce.DiscountTier `json:"discount_tiers"`
+	UsageDescription        string                  `json:"usage_description"`
 }
 
 type AdminConfiguration struct {
@@ -76,18 +78,20 @@ func (s *Store) AdminConfiguration(ctx context.Context, deployment string) (*Adm
 		c.Settings["text"] = map[string]string{}
 	}
 	var reset, unapproved int
+	var minTopup int64
 	var approvedRequired bool
-	if err = s.DB.QueryRow(ctx, `SELECT retail_trial_reset_days,unapproved_trial_daily_limit,COALESCE((configuration->>'reseller_approved_required')::boolean,false) FROM deployments WHERE id=$1`, deployment).Scan(&reset, &unapproved, &approvedRequired); err != nil {
+	if err = s.DB.QueryRow(ctx, `SELECT retail_trial_reset_days,unapproved_trial_daily_limit,COALESCE((configuration->>'reseller_approved_required')::boolean,false),COALESCE((configuration->>'min_topup_toman')::bigint,0) FROM deployments WHERE id=$1`, deployment).Scan(&reset, &unapproved, &approvedRequired, &minTopup); err != nil {
 		return nil, err
 	}
 	c.Settings["retail_trial_reset_days"] = reset
 	c.Settings["unapproved_trial_daily_limit"] = unapproved
 	c.Settings["reseller_approved_required"] = approvedRequired
+	c.Settings["min_topup_toman"] = minTopup
 	c.PaymentInstructions = map[string]string{"card_number": card, "card_owner": owner, "instructions": instructions}
 	c.Panel = map[string]any{"id": panelID, "base_url": baseURL, "token_configured": tokenConfigured}
 	rows, err := s.DB.Query(ctx, `SELECT id,name,kind,enabled,is_limited,description,base_price_toman,price_per_extra_ip_toman,
 		price_per_gb_toman,price_per_extra_month_toman,base_ip_limit,max_ip_limit,min_data_gb,max_data_bytes,expire_seconds,
-		test_ip_limit,max_per_day,flow,COALESCE(array_to_json(inbound_ids)::text,'[]'),usage_description
+		test_ip_limit,max_per_day,flow,COALESCE(array_to_json(inbound_ids)::text,'[]'),discount_tiers::text,usage_description
 		FROM plans WHERE deployment_id=$1 ORDER BY id`, deployment)
 	if err != nil {
 		return nil, err
@@ -95,10 +99,10 @@ func (s *Store) AdminConfiguration(ctx context.Context, deployment string) (*Adm
 	defer rows.Close()
 	for rows.Next() {
 		var p AdminPlan
-		var ids string
+		var ids, discounts string
 		if err = rows.Scan(&p.ID, &p.Name, &p.Kind, &p.Enabled, &p.IsLimited, &p.Description, &p.BasePriceToman, &p.PricePerExtraIPToman,
 			&p.PricePerGBToman, &p.PricePerExtraMonthToman, &p.BaseIPLimit, &p.MaxIPLimit, &p.MinDataGB, &p.MaxDataBytes, &p.ExpireSeconds,
-			&p.TestIPLimit, &p.MaxPerDay, &p.Flow, &ids, &p.UsageDescription); err != nil {
+			&p.TestIPLimit, &p.MaxPerDay, &p.Flow, &ids, &discounts, &p.UsageDescription); err != nil {
 			return nil, err
 		}
 		if err = json.Unmarshal([]byte(ids), &p.InboundIDs); err != nil {
@@ -106,6 +110,12 @@ func (s *Store) AdminConfiguration(ctx context.Context, deployment string) (*Adm
 		}
 		if p.InboundIDs == nil {
 			p.InboundIDs = []int{}
+		}
+		if err = json.Unmarshal([]byte(discounts), &p.DiscountTiers); err != nil {
+			return nil, err
+		}
+		if p.DiscountTiers == nil {
+			p.DiscountTiers = []commerce.DiscountTier{}
 		}
 		c.Plans = append(c.Plans, p)
 	}
@@ -122,6 +132,14 @@ func validateAdminPlan(p AdminPlan) error {
 	for _, id := range p.InboundIDs {
 		if id <= 0 {
 			return fmt.Errorf("%w: inbound_ids must contain positive IDs", ErrInvalidAdminConfig)
+		}
+	}
+	if len(p.DiscountTiers) > 64 {
+		return fmt.Errorf("%w: discount_tiers has too many entries", ErrInvalidAdminConfig)
+	}
+	for _, tier := range p.DiscountTiers {
+		if tier.Months < 1 || tier.BasisPoints < 0 || tier.BasisPoints > 10000 {
+			return fmt.Errorf("%w: discount tiers require positive months and basis points 0..10000", ErrInvalidAdminConfig)
 		}
 	}
 	return nil
@@ -141,9 +159,16 @@ func (s *Store) SaveAdminPlan(ctx context.Context, deployment string, actorID in
 		return 0, err
 	}
 	if p.ID == 0 {
-		err := tx.QueryRow(ctx, `INSERT INTO plans(deployment_id,panel_id,kind,name,enabled,is_limited,description,base_price_toman,price_per_extra_ip_toman,
-		price_per_gb_toman,price_per_extra_month_toman,base_ip_limit,max_ip_limit,min_data_gb,max_data_bytes,expire_seconds,test_ip_limit,max_per_day,flow,inbound_ids,usage_description)
-		VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21) RETURNING id`, deployment, panelID, p.Kind, strings.TrimSpace(p.Name), p.Enabled, p.IsLimited, p.Description, p.BasePriceToman, p.PricePerExtraIPToman, p.PricePerGBToman, p.PricePerExtraMonthToman, p.BaseIPLimit, p.MaxIPLimit, p.MinDataGB, p.MaxDataBytes, p.ExpireSeconds, p.TestIPLimit, p.MaxPerDay, p.Flow, p.InboundIDs, p.UsageDescription).Scan(&p.ID)
+		if p.DiscountTiers == nil {
+			p.DiscountTiers = []commerce.DiscountTier{}
+		}
+		discountJSON, err := json.Marshal(p.DiscountTiers)
+		if err != nil {
+			return 0, err
+		}
+		err = tx.QueryRow(ctx, `INSERT INTO plans(deployment_id,panel_id,kind,name,enabled,is_limited,description,base_price_toman,price_per_extra_ip_toman,
+		price_per_gb_toman,price_per_extra_month_toman,base_ip_limit,max_ip_limit,min_data_gb,max_data_bytes,expire_seconds,test_ip_limit,max_per_day,flow,inbound_ids,usage_description,discount_tiers)
+		VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22::jsonb) RETURNING id`, deployment, panelID, p.Kind, strings.TrimSpace(p.Name), p.Enabled, p.IsLimited, p.Description, p.BasePriceToman, p.PricePerExtraIPToman, p.PricePerGBToman, p.PricePerExtraMonthToman, p.BaseIPLimit, p.MaxIPLimit, p.MinDataGB, p.MaxDataBytes, p.ExpireSeconds, p.TestIPLimit, p.MaxPerDay, p.Flow, p.InboundIDs, p.UsageDescription, discountJSON).Scan(&p.ID)
 		if err != nil {
 			return 0, err
 		}
@@ -155,9 +180,16 @@ func (s *Store) SaveAdminPlan(ctx context.Context, deployment string, actorID in
 		}
 		return p.ID, nil
 	}
+	var discountJSON []byte
+	if p.DiscountTiers != nil {
+		discountJSON, err = json.Marshal(p.DiscountTiers)
+		if err != nil {
+			return 0, err
+		}
+	}
 	tag, err := tx.Exec(ctx, `UPDATE plans SET name=$3,kind=$4,enabled=$5,is_limited=$6,description=$7,base_price_toman=$8,price_per_extra_ip_toman=$9,
 		price_per_gb_toman=$10,price_per_extra_month_toman=$11,base_ip_limit=$12,max_ip_limit=$13,min_data_gb=$14,max_data_bytes=$15,expire_seconds=$16,
-		test_ip_limit=$17,max_per_day=$18,flow=$19,inbound_ids=$20,usage_description=$21,updated_at=now() WHERE deployment_id=$1 AND id=$2`, deployment, p.ID, strings.TrimSpace(p.Name), p.Kind, p.Enabled, p.IsLimited, p.Description, p.BasePriceToman, p.PricePerExtraIPToman, p.PricePerGBToman, p.PricePerExtraMonthToman, p.BaseIPLimit, p.MaxIPLimit, p.MinDataGB, p.MaxDataBytes, p.ExpireSeconds, p.TestIPLimit, p.MaxPerDay, p.Flow, p.InboundIDs, p.UsageDescription)
+		test_ip_limit=$17,max_per_day=$18,flow=$19,inbound_ids=$20,usage_description=$21,discount_tiers=COALESCE($22::jsonb,discount_tiers),updated_at=now() WHERE deployment_id=$1 AND id=$2`, deployment, p.ID, strings.TrimSpace(p.Name), p.Kind, p.Enabled, p.IsLimited, p.Description, p.BasePriceToman, p.PricePerExtraIPToman, p.PricePerGBToman, p.PricePerExtraMonthToman, p.BaseIPLimit, p.MaxIPLimit, p.MinDataGB, p.MaxDataBytes, p.ExpireSeconds, p.TestIPLimit, p.MaxPerDay, p.Flow, p.InboundIDs, p.UsageDescription, discountJSON)
 	if err != nil {
 		return 0, err
 	}
@@ -195,12 +227,15 @@ func (s *Store) SavePaymentInstructions(ctx context.Context, deployment string, 
 	return tx.Commit(ctx)
 }
 
-func (s *Store) PatchAdminSettings(ctx context.Context, deployment string, actorID int64, resetDays, unapprovedLimit *int, approvedRequired *bool, features, text map[string]any) error {
+func (s *Store) PatchAdminSettings(ctx context.Context, deployment string, actorID int64, resetDays, unapprovedLimit *int, minTopupToman *int64, approvedRequired *bool, features, text map[string]any) error {
 	if resetDays != nil && (*resetDays < -3650 || *resetDays > 36500) {
 		return fmt.Errorf("%w: retail_trial_reset_days outside allowed bounds", ErrInvalidAdminConfig)
 	}
 	if unapprovedLimit != nil && (*unapprovedLimit < 1 || *unapprovedLimit > 10000) {
 		return fmt.Errorf("%w: unapproved_trial_daily_limit outside allowed bounds", ErrInvalidAdminConfig)
+	}
+	if minTopupToman != nil && (*minTopupToman < 0 || *minTopupToman > 1_000_000_000_000) {
+		return fmt.Errorf("%w: min_topup_toman outside allowed bounds", ErrInvalidAdminConfig)
 	}
 	if err := validateConfigMap(features, true); err != nil {
 		return err
@@ -232,6 +267,9 @@ func (s *Store) PatchAdminSettings(ctx context.Context, deployment string, actor
 	}
 	if approvedRequired != nil {
 		current["reseller_approved_required"] = *approvedRequired
+	}
+	if minTopupToman != nil {
+		current["min_topup_toman"] = *minTopupToman
 	}
 	encoded, err := json.Marshal(current)
 	if err != nil {

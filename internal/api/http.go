@@ -172,11 +172,12 @@ func (h *Handler) plans(w http.ResponseWriter, r *http.Request) {
 	}
 	public := make([]map[string]any, 0, len(plans))
 	for _, p := range plans {
-		item := map[string]any{"id": p.ID, "name": p.Name, "kind": p.Kind, "is_limited": p.IsLimited,
+		item := map[string]any{"id": p.ID, "name": p.Name, "description": p.Description, "kind": p.Kind, "is_limited": p.IsLimited,
 			"base_price_toman": p.BasePriceToman, "price_per_extra_ip_toman": p.PricePerExtraIPToman,
 			"price_per_gb_toman": p.PricePerGBToman, "price_per_extra_month_toman": p.PricePerExtraMonthToman,
 			"base_ip_limit": p.BaseIPLimit, "max_ip_limit": p.MaxIPLimit, "min_data_gb": p.MinDataGB,
-			"max_data_bytes": p.MaxDataBytes, "expire_seconds": p.ExpireSeconds, "usage_description": p.UsageDescription}
+			"max_data_bytes": p.MaxDataBytes, "expire_seconds": p.ExpireSeconds, "usage_description": p.UsageDescription,
+			"discount_tiers": p.DiscountTiers}
 		public = append(public, item)
 	}
 	writeJSON(w, 200, public)
@@ -524,12 +525,13 @@ func (h *Handler) paymentInstructions(w http.ResponseWriter, r *http.Request) {
 	}
 	p := principalFrom(r)
 	var card, owner, details string
-	err := h.Store.DB.QueryRow(r.Context(), `SELECT payment_card_number,payment_card_owner,payment_instructions FROM deployments WHERE id=$1`, p.DeploymentID).Scan(&card, &owner, &details)
+	var minimum int64
+	err := h.Store.DB.QueryRow(r.Context(), `SELECT payment_card_number,payment_card_owner,payment_instructions,COALESCE((configuration->>'min_topup_toman')::bigint,0) FROM deployments WHERE id=$1`, p.DeploymentID).Scan(&card, &owner, &details, &minimum)
 	if err != nil {
 		h.fail(w, err)
 		return
 	}
-	writeJSON(w, 200, map[string]string{"card_number": card, "card_owner": owner, "instructions": details})
+	writeJSON(w, 200, map[string]any{"card_number": card, "card_owner": owner, "instructions": details, "min_topup_toman": minimum})
 }
 
 func (h *Handler) actor(w http.ResponseWriter, r *http.Request) (*store.Actor, bool) {
@@ -589,6 +591,8 @@ func (h *Handler) fail(w http.ResponseWriter, err error) {
 		writeError(w, 404, "not_found", "resource was not found in this deployment/account")
 	case errors.Is(err, store.ErrForbidden):
 		writeError(w, 403, "forbidden", "actor is not authorized")
+	case errors.Is(err, store.ErrTopupBelowMinimum):
+		writeError(w, http.StatusBadRequest, "min_topup_not_met", err.Error())
 	case errors.Is(err, store.ErrConflict), errors.Is(err, store.ErrQuotaExceeded):
 		writeError(w, 409, "conflict", err.Error())
 	case errors.Is(err, store.ErrInsufficientFunds):

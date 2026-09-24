@@ -23,6 +23,7 @@ var (
 	ErrInsufficientFunds  = errors.New("insufficient wallet balance")
 	ErrQuotaExceeded      = errors.New("trial quota exceeded")
 	ErrInvalidAdminConfig = errors.New("invalid admin configuration")
+	ErrTopupBelowMinimum  = errors.New("top-up amount is below the configured minimum")
 )
 
 type Store struct{ DB *pgxpool.Pool }
@@ -150,7 +151,7 @@ func (s *Store) ListPlans(ctx context.Context, a *Actor, kind string) ([]commerc
 	if kind != "paid" && kind != "test" {
 		return nil, fmt.Errorf("unsupported plan kind")
 	}
-	rows, err := s.DB.Query(ctx, `SELECT p.id,p.name,p.kind,p.enabled,p.is_limited,p.base_price_toman,p.price_per_extra_ip_toman,p.price_per_gb_toman,p.price_per_extra_month_toman,
+	rows, err := s.DB.Query(ctx, `SELECT p.id,p.name,p.description,p.kind,p.enabled,p.is_limited,p.base_price_toman,p.price_per_extra_ip_toman,p.price_per_gb_toman,p.price_per_extra_month_toman,
 		base_ip_limit,max_ip_limit,min_data_gb,max_data_bytes,expire_seconds,test_ip_limit,max_per_day,flow,
 		array_to_json(inbound_ids)::text,discount_tiers::text,usage_description,panel_id
 		FROM plans p WHERE p.deployment_id=$1 AND p.kind=$2 AND p.enabled
@@ -175,7 +176,7 @@ type scanner interface{ Scan(...any) error }
 func scanPlan(r scanner) (commerce.Plan, error) {
 	var p commerce.Plan
 	var inboundJSON, discountJSON string
-	err := r.Scan(&p.ID, &p.Name, &p.Kind, &p.Enabled, &p.IsLimited, &p.BasePriceToman, &p.PricePerExtraIPToman, &p.PricePerGBToman, &p.PricePerExtraMonthToman,
+	err := r.Scan(&p.ID, &p.Name, &p.Description, &p.Kind, &p.Enabled, &p.IsLimited, &p.BasePriceToman, &p.PricePerExtraIPToman, &p.PricePerGBToman, &p.PricePerExtraMonthToman,
 		&p.BaseIPLimit, &p.MaxIPLimit, &p.MinDataGB, &p.MaxDataBytes, &p.ExpireSeconds, &p.IPLimit, &p.MaxPerDay, &p.Flow, &inboundJSON, &discountJSON, &p.UsageDescription, &p.PanelID)
 	if err != nil {
 		return p, err
@@ -196,7 +197,7 @@ func scanPlan(r scanner) (commerce.Plan, error) {
 }
 
 func planByID(ctx context.Context, tx pgx.Tx, deployment string, accountID, id int64) (commerce.Plan, error) {
-	p, err := scanPlan(tx.QueryRow(ctx, `SELECT id,name,kind,enabled,is_limited,base_price_toman,price_per_extra_ip_toman,price_per_gb_toman,price_per_extra_month_toman,
+	p, err := scanPlan(tx.QueryRow(ctx, `SELECT id,name,description,kind,enabled,is_limited,base_price_toman,price_per_extra_ip_toman,price_per_gb_toman,price_per_extra_month_toman,
 		base_ip_limit,max_ip_limit,min_data_gb,max_data_bytes,expire_seconds,test_ip_limit,max_per_day,flow,
 		array_to_json(inbound_ids)::text,discount_tiers::text,usage_description,panel_id
 		FROM plans p WHERE p.deployment_id=$1 AND p.id=$3

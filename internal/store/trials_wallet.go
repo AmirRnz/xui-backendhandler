@@ -194,6 +194,13 @@ func (s *Store) CreateTopup(ctx context.Context, a *Actor, amount int64, key str
 	if !errors.Is(err, pgx.ErrNoRows) {
 		return 0, err
 	}
+	var minimum int64
+	if err = tx.QueryRow(ctx, `SELECT COALESCE((configuration->>'min_topup_toman')::bigint,0) FROM deployments WHERE id=$1`, a.DeploymentID).Scan(&minimum); err != nil {
+		return 0, err
+	}
+	if amount < minimum {
+		return 0, fmt.Errorf("%w: minimum top-up amount is %d Toman", ErrTopupBelowMinimum, minimum)
+	}
 	err = tx.QueryRow(ctx, `INSERT INTO topup_requests(deployment_id,account_id,actor_id,amount_toman,operation_key,input_hash,status) VALUES($1,$2,$3,$4,$5,$6,'awaiting_receipt') ON CONFLICT(deployment_id,account_id,operation_key) DO NOTHING RETURNING id`, a.DeploymentID, a.AccountID, a.ID, amount, key, hash).Scan(&id)
 	if errors.Is(err, pgx.ErrNoRows) {
 		err = tx.QueryRow(ctx, `SELECT id,input_hash FROM topup_requests WHERE deployment_id=$1 AND account_id=$2 AND operation_key=$3`, a.DeploymentID, a.AccountID, key).Scan(&id, &oldHash)

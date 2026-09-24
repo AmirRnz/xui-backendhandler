@@ -65,7 +65,7 @@ func TestAdminConfigIsDeploymentScopedAndSecretsAreWriteOnly(t *testing.T) {
 	if rec := request(http.MethodGet, "/v1/features", finToken, "971991", ""); rec.Code != 200 {
 		t.Fatalf("public feature config status=%d body=%s", rec.Code, rec.Body.String())
 	}
-	plan := `{"name":"admin draft","kind":"paid","enabled":false,"is_limited":false,"description":"","base_price_toman":1000,"price_per_extra_ip_toman":0,"price_per_gb_toman":0,"price_per_extra_month_toman":0,"base_ip_limit":1,"max_ip_limit":1,"min_data_gb":0,"max_data_bytes":0,"expire_seconds":0,"test_ip_limit":1,"max_per_day":0,"flow":"","inbound_ids":[],"usage_description":""}`
+	plan := `{"name":"admin draft","kind":"paid","enabled":false,"is_limited":false,"description":"","base_price_toman":1000,"price_per_extra_ip_toman":0,"price_per_gb_toman":0,"price_per_extra_month_toman":0,"base_ip_limit":1,"max_ip_limit":1,"min_data_gb":0,"max_data_bytes":0,"expire_seconds":0,"test_ip_limit":1,"max_per_day":0,"flow":"","inbound_ids":[],"discount_tiers":[{"months":12,"basis_points":750}],"usage_description":""}`
 	created := request(http.MethodPost, "/v1/admin/config/plans", finToken, "96937669", plan)
 	if created.Code != http.StatusCreated {
 		t.Fatalf("plan create status=%d body=%s", created.Code, created.Body.String())
@@ -117,6 +117,34 @@ func TestAdminConfigIsDeploymentScopedAndSecretsAreWriteOnly(t *testing.T) {
 	}
 	if audits < 4 {
 		t.Fatalf("expected configuration changes to be audited, got %d", audits)
+	}
+	var discountsJSON string
+	if err := s.DB.QueryRow(ctx, `SELECT discount_tiers::text FROM plans WHERE deployment_id='retail-finland' AND id=$1`, createdPlan.ID).Scan(&discountsJSON); err != nil {
+		t.Fatal(err)
+	}
+	var discounts []struct {
+		Months      int   `json:"months"`
+		BasisPoints int64 `json:"basis_points"`
+	}
+	if err := json.Unmarshal([]byte(discountsJSON), &discounts); err != nil {
+		t.Fatal(err)
+	}
+	if len(discounts) != 1 || discounts[0].Months != 12 || discounts[0].BasisPoints != 750 {
+		t.Fatalf("admin plan API did not preserve integer discount tiers: %+v", discounts)
+	}
+	legacyUpdate := strings.Replace(plan, `,"discount_tiers":[{"months":12,"basis_points":750}]`, "", 1)
+	updated := request(http.MethodPut, fmt.Sprintf("/v1/admin/config/plans/%d", createdPlan.ID), finToken, "96937669", legacyUpdate)
+	if updated.Code != http.StatusOK {
+		t.Fatalf("update without optional discount_tiers failed: status=%d body=%s", updated.Code, updated.Body.String())
+	}
+	if err := s.DB.QueryRow(ctx, `SELECT discount_tiers::text FROM plans WHERE deployment_id='retail-finland' AND id=$1`, createdPlan.ID).Scan(&discountsJSON); err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal([]byte(discountsJSON), &discounts); err != nil {
+		t.Fatal(err)
+	}
+	if len(discounts) != 1 || discounts[0].Months != 12 || discounts[0].BasisPoints != 750 {
+		t.Fatalf("legacy admin update erased saved discount tiers: %+v", discounts)
 	}
 }
 
