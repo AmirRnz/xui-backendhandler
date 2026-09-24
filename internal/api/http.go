@@ -459,12 +459,20 @@ func (h *Handler) activeTopup(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	v, err := h.Store.ActiveTopup(r.Context(), a)
+	beforeID, valid := activeRequestCursor(w, r)
+	if !valid {
+		return
+	}
+	items, next, err := h.Store.ActiveTopups(r.Context(), a, beforeID)
 	if err != nil {
 		h.fail(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"topup": v})
+	var newest map[string]any
+	if len(items) > 0 {
+		newest = items[0]
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"topups": items, "next_cursor": next, "topup": newest})
 }
 func (h *Handler) pendingTopups(w http.ResponseWriter, r *http.Request) {
 	a, ok := h.adminActor(w, r)
@@ -543,12 +551,33 @@ func (h *Handler) activePaymentIntent(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	v, err := h.Store.ActivePaymentIntent(r.Context(), a)
+	beforeID, valid := activeRequestCursor(w, r)
+	if !valid {
+		return
+	}
+	items, next, err := h.Store.ActivePaymentIntents(r.Context(), a, beforeID)
 	if err != nil {
 		h.fail(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"payment_intent": v})
+	var newest map[string]any
+	if len(items) > 0 {
+		newest = items[0]
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"payment_intents": items, "next_cursor": next, "payment_intent": newest})
+}
+
+func activeRequestCursor(w http.ResponseWriter, r *http.Request) (int64, bool) {
+	raw := strings.TrimSpace(r.URL.Query().Get("before_id"))
+	if raw == "" {
+		return 0, true
+	}
+	id, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil || id <= 0 {
+		writeError(w, http.StatusBadRequest, "invalid_request", "before_id must be a positive integer")
+		return 0, false
+	}
+	return id, true
 }
 func (h *Handler) pendingPayments(w http.ResponseWriter, r *http.Request) {
 	a, ok := h.adminActor(w, r)

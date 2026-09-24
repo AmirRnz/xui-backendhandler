@@ -222,24 +222,43 @@ func (s *Store) PendingPayments(ctx context.Context, a *Actor) ([]map[string]any
 	return out, rows.Err()
 }
 
-// ActivePaymentIntent returns only the current actor's resumable direct-payment request.
-func (s *Store) ActivePaymentIntent(ctx context.Context, a *Actor) (map[string]any, error) {
+const activeRequestPageSize = 100
+
+// ActivePaymentIntents returns a bounded page of this actor's resumable direct-payment requests.
+func (s *Store) ActivePaymentIntents(ctx context.Context, a *Actor, beforeID int64) ([]map[string]any, *int64, error) {
 	if a == nil || !a.Enabled {
-		return nil, ErrForbidden
+		return nil, nil, ErrForbidden
 	}
-	var id, amount int64
-	var status string
-	var created time.Time
-	err := s.DB.QueryRow(ctx, `SELECT id,amount_toman,status,created_at FROM payment_intents
-		WHERE deployment_id=$1 AND account_id=$2 AND actor_id=$3 AND status IN ('awaiting_receipt','receipt_submitted')
-		ORDER BY created_at DESC LIMIT 1`, a.DeploymentID, a.AccountID, a.ID).Scan(&id, &amount, &status, &created)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return nil, nil
+	if beforeID < 0 {
+		return nil, nil, ErrForbidden
 	}
+	rows, err := s.DB.Query(ctx, `SELECT id,amount_toman,status,created_at FROM payment_intents
+		WHERE deployment_id=$1 AND account_id=$2 AND actor_id=$3 AND status IN ('awaiting_receipt','receipt_submitted') AND ($4=0 OR id<$4)
+		ORDER BY id DESC LIMIT $5`, a.DeploymentID, a.AccountID, a.ID, beforeID, activeRequestPageSize+1)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	return map[string]any{"id": id, "status": status, "amount_toman": amount, "created_at": created}, nil
+	defer rows.Close()
+	out := make([]map[string]any, 0, activeRequestPageSize)
+	for rows.Next() {
+		var id, amount int64
+		var status string
+		var created time.Time
+		if err = rows.Scan(&id, &amount, &status, &created); err != nil {
+			return nil, nil, err
+		}
+		out = append(out, map[string]any{"id": id, "status": status, "amount_toman": amount, "created_at": created})
+	}
+	if err = rows.Err(); err != nil {
+		return nil, nil, err
+	}
+	var next *int64
+	if len(out) > activeRequestPageSize {
+		cursor := out[activeRequestPageSize-1]["id"].(int64)
+		next = &cursor
+		out = out[:activeRequestPageSize]
+	}
+	return out, next, nil
 }
 
 // RejectPayment closes an unpaid order and records one audited decision. It never settles or provisions it.

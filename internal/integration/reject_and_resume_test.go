@@ -36,13 +36,13 @@ func TestPaymentRejectIsAuditedIdempotentAndResumeIsActorScoped(t *testing.T) {
 	if err = s.SubmitReceipt(ctx, customer, purchase.PaymentIntentID, "tg-file-receipt-secret"); err != nil {
 		t.Fatal(err)
 	}
-	active, err := s.ActivePaymentIntent(ctx, customer)
-	if err != nil || active == nil || active["id"] != purchase.PaymentIntentID || active["status"] != "receipt_submitted" {
-		t.Fatalf("resume intent=%v err=%v", active, err)
+	active, next, err := s.ActivePaymentIntents(ctx, customer, 0)
+	if err != nil || next != nil || len(active) != 1 || active[0]["id"] != purchase.PaymentIntentID || active[0]["status"] != "receipt_submitted" {
+		t.Fatalf("resume intents=%v next=%v err=%v", active, next, err)
 	}
-	active, err = s.ActivePaymentIntent(ctx, other)
-	if err != nil || active != nil {
-		t.Fatalf("another actor saw active payment: %v err=%v", active, err)
+	active, next, err = s.ActivePaymentIntents(ctx, other, 0)
+	if err != nil || len(active) != 0 || next != nil {
+		t.Fatalf("another actor saw active payment: %v next=%v err=%v", active, next, err)
 	}
 	if _, err = s.RejectPayment(ctx, foreignAdmin, purchase.PaymentIntentID); !errors.Is(err, store.ErrNotFound) {
 		t.Fatalf("cross-deployment reject err=%v", err)
@@ -102,9 +102,9 @@ func TestTopupRejectHasNoCreditAndAdminReceiptOnly(t *testing.T) {
 	if err = s.SubmitTopupReceipt(ctx, customer, id, "tg-topup-evidence"); err != nil {
 		t.Fatal(err)
 	}
-	resume, err := s.ActiveTopup(ctx, customer)
-	if err != nil || resume == nil || resume["id"] != id {
-		t.Fatalf("active topup=%v err=%v", resume, err)
+	resume, next, err := s.ActiveTopups(ctx, customer, 0)
+	if err != nil || next != nil || len(resume) != 1 || resume[0]["id"] != id {
+		t.Fatalf("active topups=%v next=%v err=%v", resume, next, err)
 	}
 	pending, err := s.PendingTopups(ctx, admin)
 	if err != nil || len(pending) != 1 || pending[0]["telegram_file_id"] != "tg-topup-evidence" || pending[0]["telegram_id"] != int64(86201) {
@@ -313,8 +313,20 @@ func TestActiveRequestAPIContractSurvivesRestartAndScopesDeployment(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
-	topupID, err := s.CreateTopup(ctx, finland, 8000, "resume-api-topup")
+	olderTopupID, err := s.CreateTopup(ctx, finland, 8000, "resume-api-topup-old")
 	if err != nil {
+		t.Fatal(err)
+	}
+	newerTopupID, err := s.CreateTopup(ctx, finland, 9000, "resume-api-topup-new")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = s.SubmitTopupReceipt(ctx, finland, newerTopupID, "newer-topup-receipt-secret"); err != nil {
+		t.Fatal(err)
+	}
+	// Seed enough outstanding rows to exercise the page bound/cursor contract.
+	if _, err = s.DB.Exec(ctx, `INSERT INTO topup_requests(deployment_id,account_id,actor_id,amount_toman,operation_key,input_hash,status)
+		SELECT $1,$2,$3,1000,'resume-pagination-'||n,'resume-pagination-hash-'||n,'awaiting_receipt' FROM generate_series(1,101) n`, finland.DeploymentID, finland.AccountID, finland.ID); err != nil {
 		t.Fatal(err)
 	}
 	// Same Telegram ID in another deployment owns different records. The Finland API must never return those.
@@ -326,7 +338,8 @@ func TestActiveRequestAPIContractSurvivesRestartAndScopesDeployment(t *testing.T
 	if _, err = s.CreatePurchase(ctx, germany, germanyQuote.ID, "direct", "resume-germany-purchase", ""); err != nil {
 		t.Fatal(err)
 	}
-	if _, err = s.CreateTopup(ctx, germany, 9000, "resume-germany-topup"); err != nil {
+	germanyTopupID, err := s.CreateTopup(ctx, germany, 9000, "resume-germany-topup")
+	if err != nil {
 		t.Fatal(err)
 	}
 	token := "retail-finland-resume-test-token-000000000000"
@@ -344,7 +357,13 @@ func TestActiveRequestAPIContractSurvivesRestartAndScopesDeployment(t *testing.T
 		t.Fatalf("active payment status=%d body=%s", payment.Code, payment.Body.String())
 	}
 	var paymentBody struct {
-		Intent *struct {
+		Intents []struct {
+			ID     int64  `json:"id"`
+			Status string `json:"status"`
+			Amount int64  `json:"amount_toman"`
+		} `json:"payment_intents"`
+		NextCursor *int64 `json:"next_cursor"`
+		Intent     *struct {
 			ID      int64  `json:"id"`
 			Status  string `json:"status"`
 			Amount  int64  `json:"amount_toman"`
@@ -354,7 +373,7 @@ func TestActiveRequestAPIContractSurvivesRestartAndScopesDeployment(t *testing.T
 	if err = json.NewDecoder(bytes.NewReader(payment.Body.Bytes())).Decode(&paymentBody); err != nil {
 		t.Fatal(err)
 	}
-	if paymentBody.Intent == nil || paymentBody.Intent.ID != purchase.PaymentIntentID || paymentBody.Intent.Status != "awaiting_receipt" || paymentBody.Intent.Amount != 5000 || paymentBody.Intent.Receipt != "" {
+	if paymentBody.Intent == nil || paymentBody.Intent.ID != purchase.PaymentIntentID || paymentBody.Intent.Status != "awaiting_receipt" || paymentBody.Intent.Amount != 5000 || paymentBody.Intent.Receipt != "" || len(paymentBody.Intents) != 1 || paymentBody.NextCursor != nil || bytes.Contains(payment.Body.Bytes(), []byte("telegram_file_id")) {
 		t.Fatalf("unexpected resumable payment response: %+v", paymentBody)
 	}
 	topup := get("/v1/wallet/topups/active")
@@ -362,7 +381,13 @@ func TestActiveRequestAPIContractSurvivesRestartAndScopesDeployment(t *testing.T
 		t.Fatalf("active topup status=%d body=%s", topup.Code, topup.Body.String())
 	}
 	var topupBody struct {
-		Topup *struct {
+		Topups []struct {
+			ID     int64  `json:"id"`
+			Status string `json:"status"`
+			Amount int64  `json:"amount_toman"`
+		} `json:"topups"`
+		NextCursor *int64 `json:"next_cursor"`
+		Topup      *struct {
 			ID     int64  `json:"id"`
 			Status string `json:"status"`
 			Amount int64  `json:"amount_toman"`
@@ -371,8 +396,68 @@ func TestActiveRequestAPIContractSurvivesRestartAndScopesDeployment(t *testing.T
 	if err = json.NewDecoder(bytes.NewReader(topup.Body.Bytes())).Decode(&topupBody); err != nil {
 		t.Fatal(err)
 	}
-	if topupBody.Topup == nil || topupBody.Topup.ID != topupID || topupBody.Topup.Status != "awaiting_receipt" || topupBody.Topup.Amount != 8000 {
-		t.Fatalf("unexpected resumable topup response: %+v", topupBody)
+	if len(topupBody.Topups) != 100 || topupBody.Topup == nil || topupBody.Topup.ID != topupBody.Topups[0].ID || topupBody.Topup.Status != "awaiting_receipt" || topupBody.Topup.Amount != 1000 || topupBody.NextCursor == nil || bytes.Contains(topup.Body.Bytes(), []byte("telegram_file_id")) {
+		t.Fatalf("unexpected topup first page: %+v", topupBody)
+	}
+	var olderIsAwaiting bool
+	for _, row := range topupBody.Topups {
+		if row.ID == olderTopupID && row.Status == "awaiting_receipt" {
+			olderIsAwaiting = true
+		}
+	}
+	if olderIsAwaiting {
+		t.Fatal("older request should be on the next page after the 100 newest outstanding rows")
+	}
+	secondPage := get("/v1/wallet/topups/active?before_id=" + itoa(*topupBody.NextCursor))
+	if secondPage.Code != http.StatusOK {
+		t.Fatalf("active topup second page status=%d body=%s", secondPage.Code, secondPage.Body.String())
+	}
+	var olderPage struct {
+		Topups []struct {
+			ID     int64  `json:"id"`
+			Status string `json:"status"`
+		} `json:"topups"`
+		NextCursor *int64 `json:"next_cursor"`
+	}
+	if err = json.NewDecoder(secondPage.Body).Decode(&olderPage); err != nil {
+		t.Fatal(err)
+	}
+	if len(olderPage.Topups) != 3 || olderPage.NextCursor != nil {
+		t.Fatalf("unexpected second topup page: %+v", olderPage)
+	}
+	foundOlderAwaiting, foundNewerSubmitted := false, false
+	for _, row := range olderPage.Topups {
+		if row.ID == olderTopupID && row.Status == "awaiting_receipt" {
+			foundOlderAwaiting = true
+		}
+		if row.ID == newerTopupID && row.Status == "receipt_submitted" {
+			foundNewerSubmitted = true
+		}
+	}
+	if !foundOlderAwaiting || !foundNewerSubmitted {
+		t.Fatalf("multiple outstanding statuses not resumed: %+v", olderPage.Topups)
+	}
+	// Germany has the same Telegram ID but a distinct scope, so Finland's rows do not appear there.
+	germanyToken := "retail-germany-resume-test-token-000000000000"
+	germanyHandler := api.New(s, config.Config{ClientCredentials: []config.ClientCredential{{DeploymentID: "retail-germany", Token: germanyToken}}}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	germanyReq := httptest.NewRequest(http.MethodGet, "/v1/wallet/topups/active", nil)
+	germanyReq.Header.Set("Authorization", "Bearer "+germanyToken)
+	germanyReq.Header.Set("X-Actor-Telegram-ID", "86501")
+	germanyResponse := httptest.NewRecorder()
+	germanyHandler.ServeHTTP(germanyResponse, germanyReq)
+	var germanyBody struct {
+		Topups []struct {
+			ID int64 `json:"id"`
+		} `json:"topups"`
+	}
+	if err = json.NewDecoder(germanyResponse.Body).Decode(&germanyBody); err != nil {
+		t.Fatal(err)
+	}
+	if germanyResponse.Code != http.StatusOK {
+		t.Fatalf("Germany scoped query status=%d body=%s", germanyResponse.Code, germanyResponse.Body.String())
+	}
+	if len(germanyBody.Topups) != 1 || germanyBody.Topups[0].ID != germanyTopupID {
+		t.Fatalf("cross-deployment outstanding requests leaked: %+v", germanyBody.Topups)
 	}
 }
 
