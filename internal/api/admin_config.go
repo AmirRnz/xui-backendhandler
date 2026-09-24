@@ -12,10 +12,6 @@ import (
 
 func (h *Handler) adminActor(w http.ResponseWriter, r *http.Request) (*store.Actor, bool) {
 	deployment := principalFrom(r).DeploymentID
-	if deployment != "retail-finland" && deployment != "reseller-turk1" {
-		writeError(w, http.StatusForbidden, "forbidden", "administrator role is required")
-		return nil, false
-	}
 	raw := strings.TrimSpace(r.Header.Get("X-Actor-Telegram-ID"))
 	id, err := strconv.ParseInt(raw, 10, 64)
 	if err != nil || id <= 0 {
@@ -35,7 +31,12 @@ func (h *Handler) adminActor(w http.ResponseWriter, r *http.Request) (*store.Act
 		writeError(w, http.StatusForbidden, "forbidden", "administrator role is required")
 		return nil, false
 	}
-	if a.TelegramID != 96937669 || a.Role != "admin" || !a.Enabled || a.ApprovalStatus != "approved" {
+	designated, err := h.Store.IsDesignatedAdmin(r.Context(), deployment, a.TelegramID)
+	if err != nil {
+		h.fail(w, err)
+		return nil, false
+	}
+	if !designated || a.Role != "admin" || !a.Enabled || a.ApprovalStatus != "approved" {
 		writeError(w, http.StatusForbidden, "forbidden", "administrator role is required")
 		return nil, false
 	}

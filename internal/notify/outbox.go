@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"example.com/xui-commerce/backend/internal/config"
+	"example.com/xui-commerce/backend/internal/secrets"
 	"example.com/xui-commerce/backend/internal/store"
 )
 
@@ -46,6 +47,13 @@ func (d *Dispatcher) DispatchOnce(ctx context.Context) error {
 		chatID := item["chat_id"].(int64)
 		text := formatMessage(item["topic"].(string), item["payload"])
 		token := d.Config.TelegramTokens[deployment]
+		if token == "" && len(d.Config.PanelSecretsKey) == 32 {
+			if encrypted, secretErr := d.Store.EncryptedTelegramToken(ctx, deployment); secretErr == nil && len(encrypted) > 0 {
+				if plain, openErr := secrets.Open(d.Config.PanelSecretsKey, encrypted); openErr == nil {
+					token = string(plain)
+				}
+			}
+		}
 		sent := false
 		if token != "" && chatID > 0 {
 			sent = d.send(ctx, token, chatID, text)

@@ -39,6 +39,7 @@ The importer is deliberately a lossless raw archive and obligation ledger; it do
 
 - [API contract](docs/API.md)
 - [Migration and cutover runbook](docs/CUTOVER.md)
+- [Installer and backup/restore](docs/BACKUP.md)
 
 ## Verification
 

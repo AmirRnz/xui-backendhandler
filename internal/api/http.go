@@ -105,7 +105,39 @@ func (h *Handler) authenticate(next http.Handler) http.Handler {
 			}
 		}
 		if deployment == "" {
+			ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
+			storedDeployment, err := h.Store.AuthenticateClient(ctx, strings.TrimSpace(strings.TrimPrefix(header, prefix)))
+			cancel()
+			if err == nil {
+				deployment = storedDeployment
+			} else if !errors.Is(err, pgx.ErrNoRows) {
+				if h.Logger != nil {
+					h.Logger.Error("database client authentication failed", "error", err)
+				}
+				writeError(w, http.StatusInternalServerError, "internal_error", "request could not be authenticated")
+				return
+			}
+		}
+		if deployment == "" {
 			writeError(w, http.StatusUnauthorized, "unauthorized", "invalid client credentials")
+			return
+		}
+		checkCtx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
+		active, err := h.Store.IsDeploymentEnabled(checkCtx, deployment)
+		cancel()
+		if err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				writeError(w, http.StatusUnauthorized, "unauthorized", "invalid client credentials")
+				return
+			}
+			if h.Logger != nil {
+				h.Logger.Error("database deployment status check failed", "error", err)
+			}
+			writeError(w, http.StatusInternalServerError, "internal_error", "request could not be authenticated")
+			return
+		}
+		if !active {
+			writeError(w, http.StatusUnauthorized, "unauthorized", "client identity is disabled")
 			return
 		}
 		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), contextKey{}, principal{deployment})))

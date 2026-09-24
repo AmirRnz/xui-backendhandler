@@ -30,8 +30,8 @@ func (s *Store) ClaimWork(ctx context.Context) (*WorkItem, error) {
 	var payload []byte
 	var account, actor, sub, intent int64
 	err := s.DB.QueryRow(ctx, `WITH candidate AS (
-		SELECT id FROM work_items WHERE (status='pending' AND next_attempt_at<=now()) OR (status='running' AND lease_until<now())
-		ORDER BY id FOR UPDATE SKIP LOCKED LIMIT 1
+		SELECT w.id FROM work_items w JOIN deployments d ON d.id=w.deployment_id AND d.enabled WHERE (w.status='pending' AND w.next_attempt_at<=now()) OR (w.status='running' AND w.lease_until<now())
+		ORDER BY w.id FOR UPDATE OF w SKIP LOCKED LIMIT 1
 	) UPDATE work_items w SET status='running',attempts=attempts+1,lease_until=now()+interval '60 seconds',updated_at=now()
 	FROM candidate c WHERE w.id=c.id RETURNING w.id,w.deployment_id,COALESCE(w.account_id,0),COALESCE(w.actor_id,0),w.panel_id,COALESCE(w.subscription_id,0),COALESCE(w.payment_intent_id,0),w.operation_key,w.kind,w.desired_state,w.phase,w.attempts`,
 	).Scan(&w.ID, &w.DeploymentID, &account, &actor, &w.PanelID, &sub, &intent, &w.OperationKey, &w.Kind, &payload, &w.Phase, &w.Attempts)
@@ -241,7 +241,7 @@ func (s *Store) OutboxPending(ctx context.Context, limit int) ([]map[string]any,
 	if limit < 1 || limit > 500 {
 		limit = 100
 	}
-	rows, err := s.DB.Query(ctx, `WITH picked AS (SELECT o.id FROM outbox o WHERE (o.status='pending' AND o.next_attempt_at<=now()) OR (o.status='sending' AND o.lease_until<now()) ORDER BY o.id FOR UPDATE SKIP LOCKED LIMIT $1)
+	rows, err := s.DB.Query(ctx, `WITH picked AS (SELECT o.id FROM outbox o JOIN deployments d ON d.id=o.deployment_id AND d.enabled AND d.telegram_notifications_enabled WHERE (o.status='pending' AND o.next_attempt_at<=now()) OR (o.status='sending' AND o.lease_until<now()) ORDER BY o.id FOR UPDATE OF o SKIP LOCKED LIMIT $1)
 		UPDATE outbox o SET status='sending',lease_until=now()+interval '60 seconds',attempts=attempts+1 FROM picked p WHERE o.id=p.id
 		RETURNING o.id,o.deployment_id,COALESCE((SELECT telegram_id FROM actors WHERE id=o.actor_id),0),o.topic,o.payload::text`, limit)
 	if err != nil {
