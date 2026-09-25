@@ -17,6 +17,12 @@ sudo xui-backend
 
 `xui-backend` without arguments opens the operator menu. It can add end-user or reseller bot instances, start/stop/restart/remove their services, and create or restore instance or global backups. Adding an instance asks for its Telegram token and admin ID, 3x-ui panel URL and API token, and backend URL; a local backend URL is suggested from the configured listen port. Removing a bot revokes its API credential but retains its accounts and commerce history. See [installer and backup/restore](docs/BACKUP.md) before moving or restoring data. There is no published remote one-line installer yet.
 
+## Reviewed GitHub → Finland delivery
+
+For a runnable change, finish and verify it locally, push a reviewed feature branch, wait for CI, merge the reviewed commit to `main`, then use the managed `finland-mcp-server` connection to pull and deploy that exact `main` SHA. Keep the previous binary in protected rollback storage, replace the binary atomically, restart only affected units, and verify the deployed SHA, intended units, `/healthz`, and scoped access. GitHub Actions does not deploy automatically. Documentation-only changes do not require a VPS update.
+
+At its last sync on 2026-09-25, `/root/xui-backendhandler` on Finland was locally clean on `main` at `9e77846`; GitHub `main` is now `cf3a34b`, and commits since that VPS sync are documentation-only, so `/usr/local/bin/xui-backend` remains the code-only release at `c19f8df`. `xui-backend.service` and `xui-backend-instance-kitten.service` are active, the live database has migrations 001–014, and the prior binary is retained for rollback. No off-host backup mount or protected rehearsal env file containing `DRY_RUN_DATABASE_URL` was found at the last inspection. Do not use `upgrade.sh` for this host until it supports schema 014 and those backup/rehearsal prerequisites exist.
+
 ## Local run
 
 Use Go 1.25+ and PostgreSQL 16. Create a local database, copy `config.example.env` to an ignored `.env`, and replace every placeholder with local test credentials. Example with Docker:
@@ -57,7 +63,7 @@ The importer is deliberately a lossless raw archive and obligation ledger; it do
 ```powershell
 $env:TEST_DATABASE_URL = 'postgres://xui_test:xui_test_password@127.0.0.1:55432/xui_test?sslmode=disable'
 $env:DATABASE_URL = $env:TEST_DATABASE_URL
-gofmt -w .
+Get-ChildItem -Recurse -Filter *.go -File | ForEach-Object { gofmt -w $_.FullName }
 go vet ./...
 go test -count=1 -p 1 ./...
 go test -race -count=1 -p 1 ./internal/integration ./internal/xui

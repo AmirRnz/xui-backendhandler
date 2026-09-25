@@ -64,6 +64,67 @@ func TestDeploymentTransferLeaseDrainsRequestsAndBlocksNewOnes(t *testing.T) {
 	}
 }
 
+func TestRestoredDeploymentActivationKeepsFrozenUntilChecksPass(t *testing.T) {
+	s, db := testStore(t)
+	ctx := context.Background()
+	key := bytes.Repeat([]byte{0x44}, 32)
+	registered, err := s.RegisterInstance(ctx, store.RegisterInstanceInput{
+		DeploymentID: "retail-activation-test", Channel: "retail", DisplayName: "Activation test",
+		PanelID: "panel-retail-activation-test", PanelURL: "https://panel.example.test", PanelToken: "panel-key",
+		TelegramToken: "telegram-key", AdminTelegramID: 99124,
+	}, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = db.Exec(ctx, `UPDATE deployments SET transfer_frozen=true,restore_fingerprint='activation-hash' WHERE id=$1`, registered.DeploymentID); err != nil {
+		t.Fatal(err)
+	}
+	var accountID, actorID int64
+	if err = db.QueryRow(ctx, `SELECT a.account_id,a.id FROM actors a WHERE a.deployment_id=$1 AND a.telegram_id=$2`, registered.DeploymentID, 99124).Scan(&accountID, &actorID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = db.Exec(ctx, `INSERT INTO work_items(deployment_id,account_id,actor_id,panel_id,operation_key,input_hash,kind,desired_state) VALUES($1,$2,$3,$4,'activation-work','activation-hash','provision_add','{}'::jsonb)`, registered.DeploymentID, accountID, actorID, "panel-retail-activation-test"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = db.Exec(ctx, `INSERT INTO outbox(deployment_id,account_id,actor_id,dedupe_key,topic,payload) VALUES($1,$2,$3,'activation-notice','subscription.ready','{}'::jsonb)`, registered.DeploymentID, accountID, actorID); err != nil {
+		t.Fatal(err)
+	}
+
+	transfer, err := s.AcquireDeploymentTransferLease(ctx, registered.DeploymentID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer transfer.Release(context.Background())
+	if err = transfer.ValidateRestoredAdmin(ctx, registered.DeploymentID, registered.BackendToken, 99124); err != nil {
+		t.Fatalf("restored credential could not be validated while frozen: %v", err)
+	}
+	if enabled, err := transfer.IsEnabled(ctx, true, registered.DeploymentID); err != nil || enabled {
+		t.Fatalf("frozen deployment became enabled during activation checks: enabled=%t err=%v", enabled, err)
+	}
+
+	handler := api.New(s, config.Config{}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	req := httptest.NewRequest(http.MethodGet, "/v1/admin/config", nil)
+	req.Header.Set("Authorization", "Bearer "+registered.BackendToken)
+	req.Header.Set("X-Actor-Telegram-ID", "99124")
+	res := httptest.NewRecorder()
+	handler.ServeHTTP(res, req)
+	if res.Code != http.StatusUnauthorized {
+		t.Fatalf("frozen restored credential reached the HTTP API: status=%d body=%s", res.Code, res.Body.String())
+	}
+	if work, err := s.ClaimWork(ctx); err != nil || work != nil {
+		t.Fatalf("worker claimed work during frozen activation: work=%+v err=%v", work, err)
+	}
+	if notifications, err := s.OutboxPending(ctx, 10); err != nil || len(notifications) != 0 {
+		t.Fatalf("notification worker acted during frozen activation: items=%d err=%v", len(notifications), err)
+	}
+	requestCtx, cancel := context.WithTimeout(ctx, 150*time.Millisecond)
+	defer cancel()
+	if request, err := s.AcquireDeploymentRequestLease(requestCtx, registered.DeploymentID); err == nil {
+		_ = request.Release(context.Background())
+		t.Fatal("request lease passed the activation transfer lock")
+	}
+}
+
 func TestRestoredDeploymentRefreezeVerifiesCheckpointAndState(t *testing.T) {
 	s, db := testStore(t)
 	ctx := context.Background()
