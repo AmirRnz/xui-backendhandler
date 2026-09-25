@@ -28,6 +28,31 @@ func TestApprovedMainMenuMatchesResellerGridAndFeatureGates(t *testing.T) {
 	assertButton(t, limited[1], 0, "🆘 پشتیبانی", "support")
 }
 
+func TestAdminMenuEntryIsPrivateAndRoleGated(t *testing.T) {
+	rows := mainMenuRows(runtimeConfig{}, actor{TelegramID: adminTelegramID, Role: "admin", ApprovalStatus: "approved"})
+	private := appendAdminMenuRow(rows, &telebot.Chat{ID: adminTelegramID, Type: telebot.ChatPrivate}, actor{TelegramID: adminTelegramID, Role: "admin", ApprovalStatus: "approved"})
+	if len(private) != len(rows)+1 {
+		t.Fatalf("private admin menu rows = %d, want %d", len(private), len(rows)+1)
+	}
+	assertButton(t, private[len(private)-1], 0, "⚙️ مدیریت", "admin")
+
+	for _, tc := range []struct {
+		name string
+		chat *telebot.Chat
+		act  actor
+	}{
+		{name: "group chat", chat: &telebot.Chat{ID: -1, Type: telebot.ChatGroup}, act: actor{TelegramID: adminTelegramID, Role: "admin"}},
+		{name: "ordinary actor", chat: &telebot.Chat{ID: 42, Type: telebot.ChatPrivate}, act: actor{TelegramID: 42, Role: "reseller"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := appendAdminMenuRow(rows, tc.chat, tc.act)
+			if len(got) != len(rows) {
+				t.Fatalf("non-admin/private-gated menu rows = %d, want %d", len(got), len(rows))
+			}
+		})
+	}
+}
+
 func TestPendingMainMenuHidesCommerceAndKeepsTrialAccessRequestAndSupport(t *testing.T) {
 	rows := mainMenuRows(runtimeConfig{}, actor{Role: "reseller", ApprovalStatus: "pending"})
 	if len(rows) != 3 {

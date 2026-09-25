@@ -14,6 +14,25 @@ import (
 	"gopkg.in/telebot.v3"
 )
 
+type retailTextContext struct {
+	telebot.Context
+	sender  *telebot.User
+	chat    *telebot.Chat
+	message *telebot.Message
+	text    string
+	sent    interface{}
+	opts    []interface{}
+}
+
+func (c *retailTextContext) Sender() *telebot.User     { return c.sender }
+func (c *retailTextContext) Chat() *telebot.Chat       { return c.chat }
+func (c *retailTextContext) Message() *telebot.Message { return c.message }
+func (c *retailTextContext) Text() string              { return c.text }
+func (c *retailTextContext) Send(what interface{}, opts ...interface{}) error {
+	c.sent, c.opts = what, opts
+	return nil
+}
+
 func fakeTelegramServer(t *testing.T, capture func(string, map[string]any)) *httptest.Server {
 	t.Helper()
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -120,6 +139,42 @@ func TestRetailHomeMatchesLegacyMenuSnapshot(t *testing.T) {
 	}
 }
 
+func TestRetailHomeShowsAdminEntryOnlyToPrivateAdministrator(t *testing.T) {
+	api, backendServer := testBackend(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/v1/actors/resolve":
+			_, _ = w.Write([]byte(`{"telegram_id":96937669,"role":"admin","approval_status":"approved"}`))
+		case "/v1/features":
+			_, _ = w.Write([]byte(`{"features":{},"text":{}}`))
+		default:
+			t.Errorf("unexpected backend request: %s %s", r.Method, r.URL.String())
+			http.NotFound(w, r)
+		}
+	})
+	defer backendServer.Close()
+
+	app := &botApp{api: api, states: make(map[int64]conversation)}
+	bot, err := telebot.NewBot(telebot.Settings{Offline: true, Synchronous: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := bot.NewContext(telebot.Update{Message: &telebot.Message{
+		Sender: &telebot.User{ID: adminTelegramID}, Chat: &telebot.Chat{ID: adminTelegramID, Type: telebot.ChatPrivate},
+	}})
+	_, keyboard, err := app.homeView(ctx, "welcome")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(keyboard.InlineKeyboard) == 0 {
+		t.Fatal("administrator home has no menu rows")
+	}
+	lastRow := keyboard.InlineKeyboard[len(keyboard.InlineKeyboard)-1]
+	if len(lastRow) != 1 || lastRow[0].Text != "⚙️ مدیریت" || lastRow[0].Unique != "nav" {
+		t.Fatalf("private admin entry = %#v", lastRow)
+	}
+}
+
 func TestTelebotDispatchesLegacyPurchaseMenuCallback(t *testing.T) {
 	var planRequest bool
 	api, backendServer := testBackend(t, func(w http.ResponseWriter, r *http.Request) {
@@ -168,6 +223,49 @@ func TestTelebotDispatchesLegacyPurchaseMenuCallback(t *testing.T) {
 	}
 	if _, ok := app.consumeCallbackState(42, nonce); ok {
 		t.Fatal("callback nonce was not consumed by the real registered handler")
+	}
+}
+
+func TestAdminTextInputCanStartNewPlanFlow(t *testing.T) {
+	api, backendServer := testBackend(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.Method + " " + r.URL.Path {
+		case "POST /v1/actors/resolve":
+			_, _ = w.Write([]byte(`{"telegram_id":96937669,"role":"admin","approval_status":"approved"}`))
+		case "GET /v1/admin/config":
+			_, _ = w.Write([]byte(`{"deployment_id":"retail-test","channel":"retail","plans":[]}`))
+		default:
+			t.Errorf("unexpected backend request: %s %s", r.Method, r.URL.String())
+			http.NotFound(w, r)
+		}
+	})
+	defer backendServer.Close()
+
+	app := &botApp{api: api, states: make(map[int64]conversation)}
+	app.setState(adminTelegramID, conversation{Admin: "new-plan-name"})
+	ctx := &retailTextContext{
+		sender:  &telebot.User{ID: adminTelegramID},
+		chat:    &telebot.Chat{ID: adminTelegramID, Type: telebot.ChatPrivate},
+		message: &telebot.Message{Text: "Starter", Sender: &telebot.User{ID: adminTelegramID}},
+		text:    "Starter",
+	}
+	if err := app.text(ctx); err != nil {
+		t.Fatalf("handle new plan name: %v", err)
+	}
+	if got := app.state(adminTelegramID).Draft; got == nil || got.Name != "Starter" {
+		t.Fatalf("new plan draft = %#v, want name Starter", got)
+	}
+	if got, ok := ctx.sent.(string); !ok || !strings.Contains(got, "نوع طرح جدید") {
+		t.Fatalf("admin input response = %#v, want the plan-kind prompt", ctx.sent)
+	}
+	var keyboard *telebot.ReplyMarkup
+	for _, option := range ctx.opts {
+		if markup, ok := option.(*telebot.ReplyMarkup); ok {
+			keyboard = markup
+		}
+	}
+	if keyboard == nil || len(keyboard.InlineKeyboard) == 0 || len(keyboard.InlineKeyboard[0]) != 2 {
+		t.Fatalf("new plan kind keyboard = %#v", keyboard)
 	}
 }
 

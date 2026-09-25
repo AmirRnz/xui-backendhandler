@@ -298,6 +298,13 @@ func mainMenuRows(runtime runtimeConfig, act actor) [][]telebot.Btn {
 	return rows
 }
 
+func appendAdminMenuRow(rows [][]telebot.Btn, chat *telebot.Chat, act actor) [][]telebot.Btn {
+	if canOpenAdmin(chat, act) {
+		return append(rows, []telebot.Btn{btn("⚙️ مدیریت", "admin")})
+	}
+	return rows
+}
+
 func walletMenuRows(runtime runtimeConfig) [][]telebot.Btn {
 	actions := []telebot.Btn{btn("گردش کیف پول", "ledger")}
 	if featureEnabled(runtime.Features, "topups_enabled") {
@@ -417,7 +424,7 @@ func (a *botApp) callbackData(userID int64, raw string) ([]string, bool) {
 }
 func (a *botApp) home(c telebot.Context, act actor, message string) error {
 	runtime := a.runtime(c, act.TelegramID)
-	rows := mainMenuRows(runtime, act)
+	rows := appendAdminMenuRow(mainMenuRows(runtime, act), c.Chat(), act)
 	homepage := message == "صفحه اصلی" || message == "به پنل سرویس reseller خوش آمدید."
 	if homepage {
 		if pending, err := a.activeReceipts(c, act.TelegramID); err == nil && len(pending) > 0 {

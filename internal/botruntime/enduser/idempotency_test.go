@@ -139,6 +139,17 @@ func TestCallbackStateCanBeConsumedOnlyOnce(t *testing.T) {
 	}
 }
 
+func TestLazyCallbackStateIsStoredForNewMenus(t *testing.T) {
+	app := &botApp{states: make(map[int64]conversation)}
+	st := app.state(41)
+	if st.Nonce == "" {
+		t.Fatal("lazy state did not create a nonce")
+	}
+	if _, ok := app.consumeCallbackState(41, st.Nonce); !ok {
+		t.Fatal("callback nonce from lazily initialized state was not registered")
+	}
+}
+
 func TestAdminCommandRequiresConfiguredAdminInPrivateChat(t *testing.T) {
 	admin := &telebot.User{ID: adminTelegramID}
 	if !adminCommandSender(admin, &telebot.Chat{Type: telebot.ChatPrivate}) {
