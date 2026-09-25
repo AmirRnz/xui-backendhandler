@@ -1,7 +1,8 @@
 // Package backup creates operator-managed backups for the xui-backend runtime.
 // Global archives contain the complete PostgreSQL database and all instance
-// configuration. Instance archives contain configuration only; they do not
-// contain customer, commerce, or provisioning history.
+// configuration. Complete instance archives contain one deployment's logical
+// database closure and runtime configuration; instance-config archives are
+// available separately for configuration-only troubleshooting.
 package backup
 
 import (
@@ -28,14 +29,16 @@ const manifestName = "manifest.json"
 const maxArchiveBytes = 2 << 30
 
 type Manifest struct {
-	Format      int       `json:"format"`
-	Scope       string    `json:"scope"`
-	Instance    string    `json:"instance,omitempty"`
-	CreatedAt   time.Time `json:"created_at"`
-	Database    bool      `json:"database_included"`
-	ConfigOnly  bool      `json:"configuration_only"`
-	SQLSHA256   string    `json:"database_sha256,omitempty"`
-	ConfigFiles []string  `json:"configuration_files,omitempty"`
+	Format      int            `json:"format"`
+	Scope       string         `json:"scope"`
+	Instance    string         `json:"instance,omitempty"`
+	CreatedAt   time.Time      `json:"created_at"`
+	Database    bool           `json:"database_included"`
+	ConfigOnly  bool           `json:"configuration_only"`
+	SQLSHA256   string         `json:"database_sha256,omitempty"`
+	DataSHA256  string         `json:"instance_data_sha256,omitempty"`
+	RowCounts   map[string]int `json:"instance_row_counts,omitempty"`
+	ConfigFiles []string       `json:"configuration_files,omitempty"`
 }
 
 // CreateGlobal writes a complete database dump and all registered instance
@@ -87,6 +90,7 @@ func Validate(path string) (Manifest, error) {
 	var m Manifest
 	seen := map[string]bool{}
 	var sql []byte
+	var instanceData []byte
 	for _, f := range zr.File {
 		if f.UncompressedSize64 > maxArchiveBytes {
 			return m, errors.New("backup entry exceeds size limit")
@@ -112,13 +116,18 @@ func Validate(path string) (Manifest, error) {
 			if err != nil {
 				return m, err
 			}
+		} else if strings.HasSuffix(f.Name, "/database.json") {
+			instanceData, err = readZip(f)
+			if err != nil {
+				return m, err
+			}
 		} else {
 			if _, err = readZip(f); err != nil {
 				return m, err
 			}
 		}
 	}
-	if m.Format != 1 || (m.Scope != "global" && m.Scope != "instance-config") {
+	if (m.Format != 1 && m.Format != 2) || (m.Scope != "global" && m.Scope != "instance-config" && m.Scope != "instance") {
 		return m, errors.New("unsupported backup format")
 	}
 	if m.Scope == "global" {
@@ -138,6 +147,27 @@ func Validate(path string) (Manifest, error) {
 			if name != manifestName && name != m.Instance+"/instance.env" && name != m.Instance+"/metadata.json" {
 				return m, errors.New("instance configuration backup contains unexpected files")
 			}
+		}
+	}
+	if m.Scope == "instance" {
+		if m.Format != 2 || !m.Database || !validSlug(m.Instance) || !seen[m.Instance+"/instance.env"] || !seen[m.Instance+"/database.json"] || !seen[m.Instance+"/recovery.key"] {
+			return m, errors.New("instance backup is incomplete")
+		}
+		for name := range seen {
+			if name == manifestName {
+				continue
+			}
+			parts := strings.Split(name, "/")
+			if len(parts) != 2 || parts[0] != m.Instance || (parts[1] != "instance.env" && parts[1] != "metadata.json" && parts[1] != "database.json" && parts[1] != "recovery.key") {
+				return m, errors.New("instance backup contains unexpected files")
+			}
+		}
+		if len(instanceData) == 0 {
+			return m, errors.New("instance data archive is missing")
+		}
+		sum := sha256.Sum256(instanceData)
+		if hex.EncodeToString(sum[:]) != m.DataSHA256 {
+			return m, errors.New("instance data checksum mismatch")
 		}
 	}
 	if m.Scope == "global" {

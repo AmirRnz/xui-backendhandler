@@ -193,6 +193,87 @@ func (c *Client) GetClient(ctx context.Context, email string) (*RemoteClient, er
 	return &out, nil
 }
 
+// ListClients returns the complete client projection required to check panel
+// wide email, UUID, and subscription ID collisions. It intentionally fails if
+// the panel returns an untyped/incomplete object.
+func (c *Client) ListClients(ctx context.Context) ([]RemoteClient, error) {
+	env, err := c.request(ctx, http.MethodGet, "/panel/api/clients/list", nil)
+	if err != nil {
+		return nil, err
+	}
+	if !env.Success {
+		return nil, fmt.Errorf("panel client list rejected: %s", bounded(env.Msg))
+	}
+	var out []RemoteClient
+	if len(env.Obj) == 0 || string(env.Obj) == "null" || json.Unmarshal(env.Obj, &out) != nil {
+		return nil, errors.New("panel client list response is untyped or incomplete")
+	}
+	for _, client := range out {
+		if client.Email == "" || client.UUID == "" || client.SubID == "" {
+			return nil, errors.New("panel client list omitted email, UUID, or subscription ID")
+		}
+	}
+	return out, nil
+}
+
+type InboundAttachment struct {
+	ID      int            `json:"id"`
+	Clients []RemoteClient `json:"clientStats"`
+}
+
+// ListInboundAttachments returns full inbound rows and clientStats (the slim
+// endpoint is deliberately not used because it omits UUID and subId).
+func (c *Client) ListInboundAttachments(ctx context.Context) ([]InboundAttachment, error) {
+	env, err := c.request(ctx, http.MethodGet, "/panel/api/inbounds/list", nil)
+	if err != nil {
+		return nil, err
+	}
+	if !env.Success {
+		return nil, fmt.Errorf("panel inbound list rejected: %s", bounded(env.Msg))
+	}
+	var out []InboundAttachment
+	if len(env.Obj) == 0 || string(env.Obj) == "null" || json.Unmarshal(env.Obj, &out) != nil {
+		return nil, errors.New("panel inbound list response is untyped or incomplete")
+	}
+	for _, in := range out {
+		if in.ID <= 0 {
+			return nil, errors.New("panel inbound list omitted inbound ID")
+		}
+		for _, cl := range in.Clients {
+			if cl.Email == "" || cl.UUID == "" || cl.SubID == "" {
+				return nil, errors.New("panel inbound clientStats omitted identity fields")
+			}
+		}
+	}
+	return out, nil
+}
+
+// ListInboundOptions returns known inbound IDs for validating archived
+// attachment references before an instance restore.
+func (c *Client) ListInboundOptions(ctx context.Context) ([]int, error) {
+	env, err := c.request(ctx, http.MethodGet, "/panel/api/inbounds/options", nil)
+	if err != nil {
+		return nil, err
+	}
+	if !env.Success {
+		return nil, fmt.Errorf("panel inbound options rejected: %s", bounded(env.Msg))
+	}
+	var rows []struct {
+		ID int `json:"id"`
+	}
+	if len(env.Obj) == 0 || string(env.Obj) == "null" || json.Unmarshal(env.Obj, &rows) != nil {
+		return nil, errors.New("panel inbound options response is untyped")
+	}
+	ids := make([]int, 0, len(rows))
+	for _, row := range rows {
+		if row.ID <= 0 {
+			return nil, errors.New("panel inbound options omitted inbound ID")
+		}
+		ids = append(ids, row.ID)
+	}
+	return ids, nil
+}
+
 func (c *Client) Add(ctx context.Context, config ClientConfig, inbounds []int) WriteResult {
 	if err := c.CheckWriteReadiness(ctx); err != nil {
 		return WriteResult{Outcome: DefinitiveNoWrite, Err: err}

@@ -42,28 +42,52 @@ func (d *Dispatcher) DispatchOnce(ctx context.Context) error {
 		return err
 	}
 	for _, item := range items {
-		id := item["id"].(int64)
-		deployment := item["deployment_id"].(string)
-		chatID := item["chat_id"].(int64)
-		text := formatMessage(item["topic"].(string), item["payload"])
-		token := d.Config.TelegramTokens[deployment]
-		if token == "" && len(d.Config.PanelSecretsKey) == 32 {
-			if encrypted, secretErr := d.Store.EncryptedTelegramToken(ctx, deployment); secretErr == nil && len(encrypted) > 0 {
-				if plain, openErr := secrets.Open(d.Config.PanelSecretsKey, encrypted); openErr == nil {
-					token = string(plain)
-				}
-			}
-		}
-		sent := false
-		if token != "" && chatID > 0 {
-			sent = d.send(ctx, token, chatID, text)
-		}
-		if err = d.Store.MarkOutbox(ctx, id, sent); err != nil {
+		if err = d.dispatchOne(ctx, item); err != nil {
 			return err
 		}
-		if !sent && d.Logger != nil {
-			d.Logger.Warn("durable notification delivery failed; it will retry", "outbox_id", id, "deployment_id", deployment)
+	}
+	return nil
+}
+
+func (d *Dispatcher) dispatchOne(ctx context.Context, item map[string]any) error {
+	id := item["id"].(int64)
+	deployment := item["deployment_id"].(string)
+	leaseCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	lease, err := d.Store.AcquireDeploymentRequestLease(leaseCtx, deployment)
+	cancel()
+	if err != nil {
+		return err
+	}
+	defer func() {
+		releaseCtx, releaseCancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer releaseCancel()
+		if releaseErr := lease.Release(releaseCtx); releaseErr != nil && d.Logger != nil {
+			d.Logger.Error("deployment notification lease release failed", "outbox_id", id, "error", releaseErr)
 		}
+	}()
+	active, err := lease.IsEnabled(ctx, false, deployment)
+	if err != nil || !active {
+		return err
+	}
+	chatID := item["chat_id"].(int64)
+	text := formatMessage(item["topic"].(string), item["payload"])
+	token := d.Config.TelegramTokens[deployment]
+	if token == "" && len(d.Config.PanelSecretsKey) == 32 {
+		if encrypted, secretErr := d.Store.EncryptedTelegramToken(ctx, deployment); secretErr == nil && len(encrypted) > 0 {
+			if plain, openErr := secrets.Open(d.Config.PanelSecretsKey, encrypted); openErr == nil {
+				token = string(plain)
+			}
+		}
+	}
+	sent := false
+	if token != "" && chatID > 0 {
+		sent = d.send(ctx, token, chatID, text)
+	}
+	if err = d.Store.MarkOutbox(ctx, id, sent); err != nil {
+		return err
+	}
+	if !sent && d.Logger != nil {
+		d.Logger.Warn("durable notification delivery failed; it will retry", "outbox_id", id, "deployment_id", deployment)
 	}
 	return nil
 }

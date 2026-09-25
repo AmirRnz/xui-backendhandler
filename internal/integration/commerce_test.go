@@ -113,7 +113,7 @@ func TestMigrationsRerunAndTenantIdentityIsolation(t *testing.T) {
 	if err := s.DB.QueryRow(context.Background(), `SELECT count(*) FROM schema_migrations`).Scan(&migrations); err != nil {
 		t.Fatal(err)
 	}
-	if migrations != 12 {
+	if migrations != 14 {
 		t.Fatalf("migration rerun produced %d versions", migrations)
 	}
 	finland := resolve(t, s, "retail-finland", 81001)

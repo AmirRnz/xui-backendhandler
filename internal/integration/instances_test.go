@@ -8,12 +8,91 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"example.com/xui-commerce/backend/internal/api"
 	"example.com/xui-commerce/backend/internal/config"
 	"example.com/xui-commerce/backend/internal/secrets"
 	"example.com/xui-commerce/backend/internal/store"
 )
+
+func TestDeploymentTransferLeaseDrainsRequestsAndBlocksNewOnes(t *testing.T) {
+	s, _ := testStore(t)
+	request, err := s.AcquireDeploymentRequestLease(context.Background(), "lease-test-deployment")
+	if err != nil {
+		t.Fatal(err)
+	}
+	gotTransfer := make(chan *store.DeploymentRequestLease, 1)
+	gotErr := make(chan error, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		lease, e := s.AcquireDeploymentTransferLease(ctx, "lease-test-deployment")
+		if e != nil {
+			gotErr <- e
+			return
+		}
+		gotTransfer <- lease
+	}()
+	select {
+	case lease := <-gotTransfer:
+		_ = lease.Release(context.Background())
+		t.Fatal("transfer lock passed an in-flight request")
+	case err := <-gotErr:
+		t.Fatal(err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	if err = request.Release(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	var transfer *store.DeploymentRequestLease
+	select {
+	case transfer = <-gotTransfer:
+	case err = <-gotErr:
+		t.Fatal(err)
+	case <-time.After(3 * time.Second):
+		t.Fatal("transfer lock did not acquire after request completion")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
+	defer cancel()
+	if request, err = s.AcquireDeploymentRequestLease(ctx, "lease-test-deployment"); err == nil {
+		_ = request.Release(context.Background())
+		t.Fatal("new request passed an active transfer lock")
+	}
+	if err = transfer.Release(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRestoredDeploymentRefreezeVerifiesCheckpointAndState(t *testing.T) {
+	s, db := testStore(t)
+	ctx := context.Background()
+	key := bytes.Repeat([]byte{0x33}, 32)
+	registered, err := s.RegisterInstance(ctx, store.RegisterInstanceInput{
+		DeploymentID: "retail-refreeze-test", Channel: "retail", DisplayName: "Refreeze test",
+		PanelID: "panel-refreeze-test", PanelURL: "https://panel.example.test", PanelToken: "panel-key",
+		TelegramToken: "telegram-key", AdminTelegramID: 99123,
+	}, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = db.Exec(ctx, `UPDATE deployments SET transfer_frozen=false,restore_fingerprint='archive-hash' WHERE id=$1`, registered.DeploymentID); err != nil {
+		t.Fatal(err)
+	}
+	if err = s.RefreezeRestoredDeployment(ctx, registered.DeploymentID, "wrong-archive"); err == nil {
+		t.Fatal("freeze must refuse a mismatched restore checkpoint")
+	}
+	var frozen bool
+	if err = db.QueryRow(ctx, `SELECT transfer_frozen FROM deployments WHERE id=$1`, registered.DeploymentID).Scan(&frozen); err != nil || frozen {
+		t.Fatalf("mismatched checkpoint changed state unexpectedly: frozen=%t err=%v", frozen, err)
+	}
+	if err = s.RefreezeRestoredDeployment(ctx, registered.DeploymentID, "archive-hash"); err != nil {
+		t.Fatal(err)
+	}
+	if err = db.QueryRow(ctx, `SELECT transfer_frozen FROM deployments WHERE id=$1`, registered.DeploymentID).Scan(&frozen); err != nil || !frozen {
+		t.Fatalf("refreeze was not persisted and verified: frozen=%t err=%v", frozen, err)
+	}
+}
 
 func TestRegisterInstanceCreatesScopedRuntimeIdentity(t *testing.T) {
 	s, _ := testStore(t)

@@ -140,6 +140,30 @@ func (h *Handler) authenticate(next http.Handler) http.Handler {
 			writeError(w, http.StatusUnauthorized, "unauthorized", "client identity is disabled")
 			return
 		}
+		// Hold a deployment-scoped shared lock for the full request. Transfer
+		// freeze takes the exclusive counterpart before its DB snapshot, so a
+		// request racing the freeze must either finish first or observe frozen.
+		leaseCtx, leaseCancel := context.WithTimeout(r.Context(), 5*time.Second)
+		lease, err := h.Store.AcquireDeploymentRequestLease(leaseCtx, deployment)
+		leaseCancel()
+		if err != nil {
+			writeError(w, http.StatusServiceUnavailable, "temporarily_unavailable", "deployment is being transferred")
+			return
+		}
+		defer func() {
+			releaseCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
+			if releaseErr := lease.Release(releaseCtx); releaseErr != nil && h.Logger != nil {
+				h.Logger.Error("deployment request lease release failed", "error", releaseErr)
+			}
+		}()
+		checkCtx, cancel = context.WithTimeout(r.Context(), 3*time.Second)
+		active, err = lease.IsEnabled(checkCtx, true, deployment)
+		cancel()
+		if err != nil || !active {
+			writeError(w, http.StatusUnauthorized, "unauthorized", "client identity is disabled")
+			return
+		}
 		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), contextKey{}, principal{deployment})))
 	})
 }

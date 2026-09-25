@@ -49,6 +49,23 @@ func (r *Runner) ProcessOne(ctx context.Context) error {
 	if err != nil || w == nil {
 		return err
 	}
+	leaseCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	lease, err := r.Store.AcquireDeploymentRequestLease(leaseCtx, w.DeploymentID)
+	cancel()
+	if err != nil {
+		return err
+	}
+	defer func() {
+		releaseCtx, releaseCancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer releaseCancel()
+		if releaseErr := lease.Release(releaseCtx); releaseErr != nil && r.Logger != nil {
+			r.Logger.Error("deployment work lease release failed", "work_id", w.ID, "error", releaseErr)
+		}
+	}()
+	active, err := lease.IsEnabled(ctx, false, w.DeploymentID)
+	if err != nil || !active {
+		return err
+	}
 	token := r.Config.PanelTokens[w.PanelID]
 	if len(r.Config.PanelSecretsKey) == 32 {
 		ciphertext, secretErr := r.Store.EncryptedPanelToken(ctx, w.PanelID)

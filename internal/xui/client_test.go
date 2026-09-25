@@ -122,3 +122,59 @@ func TestGetClientAndLinksUseContractPaths(t *testing.T) {
 		t.Fatalf("unexpected links: %v, %v", links, err)
 	}
 }
+
+func TestRestoreCollisionReadbackRequiresTypedFullClientAndInboundLists(t *testing.T) {
+	seen := map[string]bool{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") == "" {
+			t.Error("missing panel auth")
+		}
+		seen[r.URL.Path] = true
+		switch r.URL.Path {
+		case "/panel/api/clients/list":
+			_ = json.NewEncoder(w).Encode(map[string]any{"success": true, "obj": []any{map[string]any{"email": "alice", "uuid": "u1", "subId": "s1", "inboundIds": []int{1}}}})
+		case "/panel/api/inbounds/list":
+			_ = json.NewEncoder(w).Encode(map[string]any{"success": true, "obj": []any{map[string]any{"id": 1, "clientStats": []any{map[string]any{"email": "alice", "uuid": "u1", "subId": "s1"}}}}})
+		case "/panel/api/inbounds/options":
+			_ = json.NewEncoder(w).Encode(map[string]any{"success": true, "obj": []any{map[string]any{"id": 1}}})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+	c, err := New(srv.URL, "test-token", time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	clients, err := c.ListClients(context.Background())
+	if err != nil || len(clients) != 1 {
+		t.Fatalf("ListClients = %v, %v", clients, err)
+	}
+	inbounds, err := c.ListInboundAttachments(context.Background())
+	if err != nil || len(inbounds) != 1 || len(inbounds[0].Clients) != 1 {
+		t.Fatalf("ListInboundAttachments = %v, %v", inbounds, err)
+	}
+	options, err := c.ListInboundOptions(context.Background())
+	if err != nil || len(options) != 1 || options[0] != 1 {
+		t.Fatalf("ListInboundOptions = %v, %v", options, err)
+	}
+	for _, path := range []string{"/panel/api/clients/list", "/panel/api/inbounds/list", "/panel/api/inbounds/options"} {
+		if !seen[path] {
+			t.Errorf("did not call documented endpoint %s", path)
+		}
+	}
+}
+
+func TestListClientsFailsClosedWhenIdentityFieldsAreMissing(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"success": true, "obj": []any{map[string]any{"email": "alice", "subId": "s1"}}})
+	}))
+	defer srv.Close()
+	c, err := New(srv.URL, "test-token", time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = c.ListClients(context.Background()); err == nil {
+		t.Fatal("expected incomplete full-client response to be rejected")
+	}
+}

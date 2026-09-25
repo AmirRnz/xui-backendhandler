@@ -153,13 +153,13 @@ func isUniqueViolation(err error) bool {
 func (s *Store) AuthenticateClient(ctx context.Context, token string) (string, error) {
 	digest := sha256.Sum256([]byte(strings.TrimSpace(token)))
 	var deployment string
-	err := s.DB.QueryRow(ctx, `SELECT c.deployment_id FROM backend_client_credentials c JOIN deployments d ON d.id=c.deployment_id WHERE c.token_hash=$1 AND c.enabled AND d.enabled AND d.bot_instance_active`, digest[:]).Scan(&deployment)
+	err := s.DB.QueryRow(ctx, `SELECT c.deployment_id FROM backend_client_credentials c JOIN deployments d ON d.id=c.deployment_id WHERE c.token_hash=$1 AND c.enabled AND d.enabled AND d.bot_instance_active AND NOT d.transfer_frozen`, digest[:]).Scan(&deployment)
 	return deployment, err
 }
 
 func (s *Store) IsDeploymentEnabled(ctx context.Context, deployment string) (bool, error) {
 	var enabled bool
-	err := s.DB.QueryRow(ctx, `SELECT enabled AND bot_instance_active FROM deployments WHERE id=$1`, deployment).Scan(&enabled)
+	err := s.DB.QueryRow(ctx, `SELECT enabled AND bot_instance_active AND NOT transfer_frozen FROM deployments WHERE id=$1`, deployment).Scan(&enabled)
 	return enabled, err
 }
 

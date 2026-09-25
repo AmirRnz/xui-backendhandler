@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/http"
 	"net/url"
 	"os"
 	"os/exec"
@@ -21,6 +22,7 @@ import (
 	"time"
 
 	"example.com/xui-commerce/backend/internal/backup"
+	"example.com/xui-commerce/backend/internal/globalbackup"
 	"example.com/xui-commerce/backend/internal/panelurl"
 	"example.com/xui-commerce/backend/internal/secrets"
 	"example.com/xui-commerce/backend/internal/store"
@@ -43,6 +45,12 @@ type Config struct {
 	BackendToken string `json:"backend_token"`
 	BotToken     string `json:"telegram_bot_token"`
 	AdminID      int64  `json:"admin_telegram_id"`
+}
+
+type transferState struct {
+	DeploymentID string `json:"deployment_id"`
+	WasActive    bool   `json:"was_active"`
+	WasEnabled   bool   `json:"was_enabled"`
 }
 
 type menu struct {
@@ -84,6 +92,22 @@ func isLocalBackend(raw string) bool {
 	return ip != nil && ip.IsLoopback()
 }
 
+// localBackendURL derives the bot-facing loopback URL from the exact address
+// configured for the backend service, preventing an accidental stale port.
+func localBackendURL(listenAddr string) (string, bool) {
+	host, port, err := net.SplitHostPort(strings.TrimSpace(listenAddr))
+	if err != nil || port == "" {
+		return "", false
+	}
+	if host == "" || host == "0.0.0.0" || host == "::" {
+		host = "127.0.0.1"
+	}
+	if ip := net.ParseIP(host); ip != nil && ip.IsUnspecified() {
+		host = "127.0.0.1"
+	}
+	return "http://" + net.JoinHostPort(host, port), true
+}
+
 func Menu(ctx context.Context) error {
 	m := menu{in: bufio.NewReader(os.Stdin), out: os.Stdout}
 	for {
@@ -91,7 +115,7 @@ func Menu(ctx context.Context) error {
 		fmt.Fprintln(m.out, "1) Add bot instance")
 		fmt.Fprintln(m.out, "2) List/manage instances")
 		fmt.Fprintln(m.out, "3) Global backup or restore")
-		fmt.Fprintln(m.out, "4) Instance configuration backup or restore")
+		fmt.Fprintln(m.out, "4) Complete instance move backup or restore")
 		fmt.Fprintln(m.out, "0) Exit")
 		choice, err := m.ask("Select: ")
 		if err != nil {
@@ -107,7 +131,7 @@ func Menu(ctx context.Context) error {
 		case "3":
 			err = m.globalBackup(ctx)
 		case "4":
-			err = m.instanceBackup()
+			err = m.instanceBackup(ctx)
 		default:
 			fmt.Fprintln(m.out, "Choose one of the displayed options.")
 		}
@@ -118,6 +142,25 @@ func Menu(ctx context.Context) error {
 }
 
 func Command(args []string) error {
+	if len(args) >= 3 && args[0] == "transfer" {
+		switch args[1] {
+		case "resume":
+			if len(args) != 4 || args[3] != "--destination-stopped" {
+				return errors.New("usage: xui-backend transfer resume <source-slug> --destination-stopped")
+			}
+			return resumeTransfer(context.Background(), args[2])
+		case "inspect":
+			if len(args) != 3 {
+				return errors.New("usage: xui-backend transfer inspect <instance-slug>")
+			}
+			return inspectTransfer(context.Background(), args[2])
+		case "release-safe":
+			if len(args) != 3 {
+				return errors.New("usage: xui-backend transfer release-safe <instance-slug>")
+			}
+			return releaseSafeTransferWork(context.Background(), args[2])
+		}
+	}
 	if len(args) >= 2 && args[0] == "backup" {
 		switch args[1] {
 		case "global":
@@ -128,7 +171,21 @@ func Command(args []string) error {
 			if err != nil {
 				return err
 			}
-			return backup.CreateGlobal(context.Background(), values["DATABASE_URL"], Root(), args[2])
+			return globalbackup.Create(context.Background(), globalbackup.CreateOptions{DatabaseURL: values["DATABASE_URL"], BackendEnvPath: backendEnvPath(), InstanceRoot: Root(), UnitRoot: filepath.Dir(unitPath("probe")), Destination: args[2]})
+		case "global-move":
+			if len(args) != 4 || args[3] != "--stop-source" {
+				return errors.New("usage: xui-backend backup global-move <archive-path> --stop-source")
+			}
+			values, err := readEnvFile(backendEnvPath())
+			if err != nil {
+				return err
+			}
+			return globalbackup.Create(context.Background(), globalbackup.CreateOptions{DatabaseURL: values["DATABASE_URL"], BackendEnvPath: backendEnvPath(), InstanceRoot: Root(), UnitRoot: filepath.Dir(unitPath("probe")), Destination: args[2], QuiesceForMove: true})
+		case "instance":
+			if len(args) != 4 {
+				return errors.New("usage: xui-backend backup instance <instance-slug> <archive-path>")
+			}
+			return snapshotInstance(context.Background(), args[2], args[3])
 		case "instance-config":
 			if len(args) != 4 {
 				return errors.New("usage: xui-backend backup instance-config <slug> <archive-path>")
@@ -137,6 +194,71 @@ func Command(args []string) error {
 		}
 	}
 	if len(args) >= 2 && args[0] == "restore" {
+		if len(args) >= 4 && args[1] == "instance" {
+			if len(args) == 5 && args[4] == "--dry-run" {
+				return restoreInstance(context.Background(), args[2], args[3], true)
+			}
+			if len(args) == 5 && args[4] == "--source-stopped" {
+				return restoreInstance(context.Background(), args[2], args[3], false)
+			}
+			return errors.New("usage: xui-backend restore instance <archive> <new-instance-slug> [--dry-run|--source-stopped]")
+		}
+		if args[1] == "global-recover" {
+			if len(args) != 4 {
+				return errors.New("usage: xui-backend restore global-recover <archive> <stage>")
+			}
+			values, err := readEnvFile(backendEnvPath())
+			if err != nil {
+				return err
+			}
+			return globalbackup.Recover(context.Background(), globalbackup.RecoverOptions{DatabaseURL: values["DATABASE_URL"], Archive: args[2], Stage: args[3], BackendEnvPath: backendEnvPath(), InstanceRoot: Root(), UnitRoot: filepath.Dir(unitPath("probe"))})
+		}
+		if args[1] == "global" {
+			if len(args) < 3 {
+				return errors.New("usage: xui-backend restore global <archive> [--dry-run|--source-stopped] [--activate]")
+			}
+			dry, sourceStopped, activate := false, false, false
+			for _, option := range args[3:] {
+				switch option {
+				case "--dry-run":
+					dry = true
+				case "--source-stopped":
+					sourceStopped = true
+				case "--activate":
+					activate = true
+				default:
+					return errors.New("unknown global restore option")
+				}
+			}
+			if dry && (sourceStopped || activate) {
+				return errors.New("--dry-run cannot be combined with activation options")
+			}
+			if !dry && !sourceStopped {
+				return errors.New("global restore requires --source-stopped after you have stopped the source services")
+			}
+			values, err := readEnvFile(backendEnvPath())
+			if err != nil {
+				return err
+			}
+			opts := globalbackup.RestoreOptions{DatabaseURL: values["DATABASE_URL"], Archive: args[2], BackendEnvPath: backendEnvPath(), InstanceRoot: Root(), UnitRoot: filepath.Dir(unitPath("probe")), DryRun: dry, Activate: activate}
+			if dry {
+				plan, err := globalbackup.Preflight(context.Background(), opts)
+				if err != nil {
+					return err
+				}
+				fmt.Printf("Global restore preflight: %s; backend address %s; instances %s; database-only/bootstrap deployments %s\n", plan.DatabaseMode, plan.ListenAddr, strings.Join(plan.Instances, ", "), formatIDs(plan.DatabaseOnlyDeployments))
+				return nil
+			}
+			plan, err := globalbackup.Restore(context.Background(), opts)
+			if err != nil {
+				return err
+			}
+			fmt.Printf("Global restore complete; backend address %s; instances %s; database-only/bootstrap deployments %s. Restored work items and notifications are quarantined for review.\n", plan.ListenAddr, strings.Join(plan.Instances, ", "), formatIDs(plan.DatabaseOnlyDeployments))
+			if !activate {
+				fmt.Println("Services remain inactive. After reviewing DB/config and queued work, run systemctl daemon-reload, then start xui-backend.service and the instance services with systemctl.")
+			}
+			return nil
+		}
 		dry := len(args) == 3 && args[2] == "--dry-run"
 		if len(args) == 2 || dry {
 			values, err := readEnvFile(backendEnvPath())
@@ -171,7 +293,157 @@ func Command(args []string) error {
 			return err
 		}
 	}
-	return errors.New("usage: xui-backend [backup global <path>|backup instance-config <slug> <path>|restore <global-archive> [--dry-run]|restore instance-config <archive> <new-slug> [--dry-run]]")
+	return errors.New("usage: xui-backend [backup global <path>|backup global-move <path> --stop-source|backup instance <slug> <path>|backup instance-config <slug> <path>|restore global <archive> [--dry-run|--source-stopped] [--activate]|restore global-recover <archive> <stage>|restore instance <archive> <new-slug> [--dry-run|--source-stopped]|transfer inspect <slug>|transfer release-safe <slug>|transfer resume <slug> --destination-stopped]")
+}
+
+func formatIDs(ids []string) string {
+	if len(ids) == 0 {
+		return "none"
+	}
+	return strings.Join(ids, ", ")
+}
+
+func resumeTransfer(parent context.Context, slug string) error {
+	cfg, err := Read(slug)
+	if err != nil {
+		return err
+	}
+	state, err := readTransferState(slug)
+	if err != nil || state.DeploymentID != cfg.DeploymentID {
+		return errors.New("source transfer state is missing or does not match this deployment")
+	}
+	unitStatus := serviceStatus(slug)
+	if unitStatus != "inactive" && unitStatus != "failed" {
+		return errors.New("destination-stopped confirmation requires the source instance service to be inactive")
+	}
+	values, err := readEnvFile(backendEnvPath())
+	if err != nil {
+		return err
+	}
+	if isLocalBackend(cfg.BackendURL) {
+		if err = systemctl("start", "xui-backend.service"); err != nil {
+			return err
+		}
+	}
+	if err = checkBackendHealth(parent, cfg.BackendURL); err != nil {
+		return err
+	}
+	pool, err := pgxpool.New(parent, values["DATABASE_URL"])
+	if err != nil {
+		return errors.New("cannot configure backend database connection")
+	}
+	defer pool.Close()
+	if _, err = pool.Exec(parent, `UPDATE deployments SET transfer_frozen=false WHERE id=$1`, cfg.DeploymentID); err != nil {
+		return errors.New("could not resume source deployment")
+	}
+	if err = checkBackendIdentity(parent, cfg); err != nil {
+		_, _ = pool.Exec(context.Background(), `UPDATE deployments SET transfer_frozen=true WHERE id=$1`, cfg.DeploymentID)
+		return errors.New("source credential/admin check failed; deployment remains frozen")
+	}
+	if state.WasEnabled {
+		if err = systemctl("enable", unitName(slug)); err != nil {
+			_, _ = pool.Exec(context.Background(), `UPDATE deployments SET transfer_frozen=true WHERE id=$1`, cfg.DeploymentID)
+			return err
+		}
+	}
+	if state.WasActive {
+		if err = systemctl("start", unitName(slug)); err != nil {
+			_, _ = pool.Exec(context.Background(), `UPDATE deployments SET transfer_frozen=true WHERE id=$1`, cfg.DeploymentID)
+			return err
+		}
+	}
+	_ = os.Remove(transferStatePath(slug))
+	fmt.Println("Source instance resumed after explicit confirmation that the target is stopped.")
+	return nil
+}
+
+func transferPool(parent context.Context, slug string) (*pgxpool.Pool, string, error) {
+	cfg, err := Read(slug)
+	if err != nil {
+		return nil, "", err
+	}
+	values, err := readEnvFile(backendEnvPath())
+	if err != nil {
+		return nil, "", err
+	}
+	pool, err := pgxpool.New(parent, values["DATABASE_URL"])
+	if err != nil {
+		return nil, "", errors.New("cannot configure backend database connection")
+	}
+	return pool, cfg.DeploymentID, nil
+}
+
+func inspectTransfer(parent context.Context, slug string) error {
+	pool, deployment, err := transferPool(parent, slug)
+	if err != nil {
+		return err
+	}
+	defer pool.Close()
+	rows, err := pool.Query(parent, `SELECT id,status,phase,attempts FROM work_items WHERE deployment_id=$1 AND restore_quarantined ORDER BY id`, deployment)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("Held work for %s:\n", slug)
+	for rows.Next() {
+		var id int64
+		var status, phase string
+		var attempts int
+		if err = rows.Scan(&id, &status, &phase, &attempts); err != nil {
+			return err
+		}
+		fmt.Printf("  work_item id=%d status=%s phase=%s attempts=%d\n", id, status, phase, attempts)
+	}
+	if err = rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	rows.Close()
+	rows, err = pool.Query(parent, `SELECT id,status,attempts FROM outbox WHERE deployment_id=$1 AND restore_quarantined ORDER BY id`, deployment)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	fmt.Printf("Held notifications for %s:\n", slug)
+	for rows.Next() {
+		var id int64
+		var status string
+		var attempts int
+		if err = rows.Scan(&id, &status, &attempts); err != nil {
+			return err
+		}
+		fmt.Printf("  outbox id=%d status=%s attempts=%d\n", id, status, attempts)
+	}
+	return rows.Err()
+}
+
+func releaseSafeTransferWork(parent context.Context, slug string) error {
+	pool, deployment, err := transferPool(parent, slug)
+	if err != nil {
+		return err
+	}
+	defer pool.Close()
+	return releaseSafeDeployment(parent, pool, deployment)
+}
+
+func releaseSafeDeployment(ctx context.Context, pool *pgxpool.Pool, deployment string) error {
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		return errors.New("could not begin safe queue release")
+	}
+	defer tx.Rollback(ctx)
+	workTag, err := tx.Exec(ctx, `UPDATE work_items SET restore_quarantined=false WHERE deployment_id=$1 AND restore_quarantined AND status='pending' AND phase='ready' AND attempts=0`, deployment)
+	if err != nil {
+		return errors.New("could not release safe pending work")
+	}
+	outboxTag, err := tx.Exec(ctx, `UPDATE outbox SET restore_quarantined=false WHERE deployment_id=$1 AND restore_quarantined AND status='pending' AND attempts=0`, deployment)
+	if err != nil {
+		return errors.New("could not release safe pending notifications")
+	}
+	if err = tx.Commit(ctx); err != nil {
+		return errors.New("safe queue release did not commit")
+	}
+	fmt.Printf("Released %d never-attempted work items and %d never-attempted notifications; uncertain items remain quarantined.\n", workTag.RowsAffected(), outboxTag.RowsAffected())
+	return nil
 }
 
 func (m menu) add(ctx context.Context) error {
@@ -223,19 +495,33 @@ func (m menu) add(ctx context.Context) error {
 	if strings.TrimSpace(panelToken) == "" {
 		return errors.New("panel authentication token is required")
 	}
-	backendURL, err := m.ask("Backend URL (for example http://127.0.0.1:8088): ")
-	if err != nil {
-		return err
-	}
-	if !validBackendURL(backendURL) {
-		return errors.New("backend URL must be an HTTP(S) URL without credentials, query, or fragment")
-	}
 	backendValues, err := readEnvFile(backendEnvPath())
 	if err != nil {
 		return err
 	}
 	if backendValues["DATABASE_URL"] == "" {
 		return errors.New("DATABASE_URL is missing from backend environment file")
+	}
+	localURL, localConfigured := localBackendURL(backendValues["BACKEND_LISTEN_ADDR"])
+	prompt := "Backend URL (remote URL required): "
+	if localConfigured {
+		prompt = "Backend URL (press Enter to use configured local backend " + localURL + ", or enter a remote URL): "
+	}
+	backendURL, err := m.ask(prompt)
+	if err != nil {
+		return err
+	}
+	if backendURL == "" && localConfigured {
+		backendURL = localURL
+	}
+	if !validBackendTransport(backendURL) {
+		return errors.New("backend URL must use HTTPS remotely or HTTP only on loopback, without credentials, query, or fragment")
+	}
+	if localConfigured && isLocalBackend(backendURL) && strings.TrimRight(backendURL, "/") != localURL {
+		return errors.New("local backend URL must use the configured listen port " + localURL)
+	}
+	if err := checkBackendHealth(ctx, backendURL); err != nil {
+		return err
 	}
 	key, err := secrets.ParseKey(backendValues["BACKEND_PANEL_SECRETS_KEY"])
 	if err != nil {
@@ -286,6 +572,9 @@ func (m menu) add(ctx context.Context) error {
 		return errors.New("instance registration failed; no active instance was created")
 	}
 	cfg := Config{Slug: slug, Channel: channel, DisplayName: display, DeploymentID: result.DeploymentID, BackendURL: strings.TrimRight(backendURL, "/"), BackendToken: result.BackendToken, BotToken: botToken, AdminID: adminID}
+	if err := checkBackendIdentity(ctx, cfg); err != nil {
+		return compensateRegistration(cfg, errors.New("backend URL or generated credential did not authenticate the registered deployment"))
+	}
 	if err := save(cfg); err != nil {
 		return compensateRegistration(cfg, err)
 	}
@@ -413,7 +702,11 @@ func (m menu) manage(ctx context.Context) error {
 }
 
 func (m menu) globalBackup(ctx context.Context) error {
-	action, err := m.ask("1) Create full global backup  2) Restore global database and stage configs  3) Validate restore (dry run): ")
+	action, err := m.ask("1) Create global backup  2) Create move backup and stop source services  3) Dry-run global restore  4) Restore global system: ")
+	if err != nil {
+		return err
+	}
+	path, err := m.ask("Archive path: ")
 	if err != nil {
 		return err
 	}
@@ -424,47 +717,67 @@ func (m menu) globalBackup(ctx context.Context) error {
 	if values["DATABASE_URL"] == "" {
 		return errors.New("DATABASE_URL is missing from backend environment file")
 	}
-	path, err := m.ask("Archive path: ")
-	if err != nil {
-		return err
+	create := func(move bool) error {
+		if move {
+			confirm, e := m.ask("This stops active source bot and backend services and leaves them stopped after a successful archive. Type MOVE to continue: ")
+			if e != nil {
+				return e
+			}
+			if confirm != "MOVE" {
+				return nil
+			}
+		}
+		return globalbackup.Create(ctx, globalbackup.CreateOptions{DatabaseURL: values["DATABASE_URL"], BackendEnvPath: backendEnvPath(), InstanceRoot: Root(), UnitRoot: filepath.Dir(unitPath("probe")), Destination: path, QuiesceForMove: move})
 	}
 	if action == "1" {
-		return backup.CreateGlobal(ctx, values["DATABASE_URL"], Root(), path)
+		return create(false)
 	}
-	if action != "2" && action != "3" {
+	if action == "2" {
+		return create(true)
+	}
+	if action != "3" && action != "4" {
 		return errors.New("invalid selection")
 	}
-	dry := action == "3"
-	if !dry {
-		confirm, err := m.ask("Restores into the configured empty target database; existing data is refused. Type RESTORE to continue: ")
-		if err != nil {
-			return err
+	if action == "4" {
+		confirm, e := m.ask("Confirm the source server's backend and all bot services are stopped. Type SOURCE_STOPPED: ")
+		if e != nil {
+			return e
 		}
-		if confirm != "RESTORE" {
+		if confirm != "SOURCE_STOPPED" {
 			return nil
 		}
 	}
-	stage, err := backup.StageGlobalConfig(path, restoreStageRoot(), dry)
+	dry := action == "3"
+	opts := globalbackup.RestoreOptions{DatabaseURL: values["DATABASE_URL"], Archive: path, BackendEnvPath: backendEnvPath(), InstanceRoot: Root(), UnitRoot: filepath.Dir(unitPath("probe")), DryRun: dry}
+	if dry {
+		plan, e := globalbackup.Preflight(ctx, opts)
+		if e != nil {
+			return e
+		}
+		fmt.Fprintf(m.out, "Preflight passed: target database %s; backend will listen at %s; instances: %s\n", plan.DatabaseMode, plan.ListenAddr, strings.Join(plan.Instances, ", "))
+		return nil
+	}
+	activate, err := m.ask("After database and config validation, start the restored backend and source-active bots now? (y/N): ")
 	if err != nil {
 		return err
 	}
-	if err := backup.RestoreGlobal(ctx, values["DATABASE_URL"], path, dry); err != nil {
-		if !dry {
-			fmt.Fprintln(m.out, "Configuration was staged at:", stage)
-		}
+	opts.Activate = strings.EqualFold(activate, "y") || strings.EqualFold(activate, "yes")
+	if _, err := globalbackup.Preflight(ctx, opts); err != nil {
 		return err
 	}
-	if dry {
-		fmt.Fprintln(m.out, "Archive validated. Config staging path after restore:", stage)
-		return nil
+	plan, err := globalbackup.Restore(ctx, opts)
+	if err != nil {
+		return err
 	}
-	fmt.Fprintln(m.out, "Database restored. Archived configuration was staged for review at:", stage)
-	fmt.Fprintln(m.out, "Review backend.env and instance files there, then manually rebind and install selected configs. Nothing was activated.")
+	fmt.Fprintf(m.out, "Global system restored; backend address %s; instances: %s. Pending panel work and Telegram notifications remain quarantined until reviewed.\n", plan.ListenAddr, strings.Join(plan.Instances, ", "))
+	if !opts.Activate {
+		fmt.Fprintln(m.out, "Services remain inactive. Review the restored database and configs, then start xui-backend.service and the instance services.")
+	}
 	return nil
 }
 
-func (m menu) instanceBackup() error {
-	action, err := m.ask("1) Back up instance configuration  2) Restore instance configuration: ")
+func (m menu) instanceBackup(ctx context.Context) error {
+	action, err := m.ask("1) Back up complete instance and commercial data  2) Move/restore complete instance: ")
 	if err != nil {
 		return err
 	}
@@ -477,8 +790,7 @@ func (m menu) instanceBackup() error {
 		if err != nil {
 			return err
 		}
-		fmt.Fprintln(m.out, "This contains configuration and credentials only; it excludes customer and commerce history.")
-		return backup.CreateInstanceConfig(Root(), slug, path)
+		return snapshotInstance(ctx, slug, path)
 	}
 	if action != "2" {
 		return errors.New("invalid selection")
@@ -491,19 +803,283 @@ func (m menu) instanceBackup() error {
 	if err != nil {
 		return err
 	}
-	confirm, err := m.ask("This stages secrets outside the live instance registry; no bot will be created or started. Customer and commerce history is not included. Type RESTORE: ")
+	confirm, err := m.ask("This imports all commercial history and will activate the bot. Confirm the source bot and workers are stopped. Type SOURCE-STOPPED: ")
 	if err != nil {
 		return err
 	}
-	if confirm != "RESTORE" {
+	if confirm != "SOURCE-STOPPED" {
 		return nil
 	}
-	stage, err := backup.StageInstanceConfig(path, restoreStageRoot(), slug, false)
+	return restoreInstance(ctx, path, slug, false)
+}
+
+func snapshotInstance(ctx context.Context, slug, archive string) (retErr error) {
+	if !validSlug(slug) {
+		return errors.New("invalid instance slug")
+	}
+	cfg, err := Read(slug)
 	if err != nil {
 		return err
 	}
-	fmt.Fprintln(m.out, "Inactive instance configuration staged at:", stage)
-	fmt.Fprintln(m.out, "Review the secrets and panel settings there before manually registering the instance. No service was created or started.")
+	probe := exec.Command("systemctl", "is-active", unitName(slug))
+	out, _ := probe.CombinedOutput()
+	state := strings.TrimSpace(string(out))
+	wasActive := state == "active"
+	if !wasActive && state != "inactive" && state != "failed" {
+		return errors.New("could not verify the source instance service state")
+	}
+	wasEnabled, stateKnown := serviceIsEnabled(slug)
+	if !stateKnown {
+		return errors.New("could not verify the source instance boot-enabled state")
+	}
+	if wasActive {
+		if err = systemctl("stop", unitName(slug)); err != nil {
+			return err
+		}
+	}
+	values, err := readEnvFile(backendEnvPath())
+	if err != nil {
+		if wasActive {
+			_ = systemctl("start", unitName(slug))
+		}
+		return err
+	}
+	pool, err := pgxpool.New(ctx, values["DATABASE_URL"])
+	if err != nil {
+		if wasActive {
+			_ = systemctl("start", unitName(slug))
+		}
+		return errors.New("cannot configure backend database connection")
+	}
+	defer pool.Close()
+	var wasFrozen bool
+	if err = pool.QueryRow(ctx, `SELECT transfer_frozen FROM deployments WHERE id=$1`, cfg.DeploymentID).Scan(&wasFrozen); err != nil {
+		if wasActive {
+			_ = systemctl("start", unitName(slug))
+		}
+		return errors.New("could not inspect source transfer state")
+	}
+	if _, err = pool.Exec(ctx, `UPDATE deployments SET transfer_frozen=true WHERE id=$1`, cfg.DeploymentID); err != nil {
+		if wasActive {
+			_ = systemctl("start", unitName(slug))
+		}
+		return errors.New("could not freeze source deployment workers")
+	}
+	resume := true
+	defer func() {
+		if resume {
+			if !wasFrozen {
+				_, _ = pool.Exec(context.Background(), `UPDATE deployments SET transfer_frozen=false WHERE id=$1`, cfg.DeploymentID)
+			}
+			if wasActive && !wasFrozen {
+				_ = systemctl("start", unitName(slug))
+			}
+			if wasEnabled {
+				_ = systemctl("enable", unitName(slug))
+			}
+			_ = os.Remove(transferStatePath(slug))
+		}
+	}()
+	stateFile := transferState{DeploymentID: cfg.DeploymentID, WasActive: wasActive, WasEnabled: wasEnabled}
+	stateData, err := json.Marshal(stateFile)
+	if err != nil {
+		return errors.New("could not record source transfer rollback state")
+	}
+	if err = os.WriteFile(transferStatePath(slug), stateData, 0600); err != nil {
+		return errors.New("could not persist source transfer rollback state")
+	}
+	transferCtx, transferCancel := context.WithTimeout(ctx, 5*time.Minute)
+	transferLease, err := (&store.Store{DB: pool}).AcquireDeploymentTransferLease(transferCtx, cfg.DeploymentID)
+	transferCancel()
+	if err != nil {
+		return errors.New("could not drain in-flight deployment API requests")
+	}
+	defer func() {
+		releaseCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if releaseErr := transferLease.Release(releaseCtx); releaseErr != nil {
+			retErr = errors.Join(retErr, errors.New("could not release deployment transfer lock"))
+		}
+	}()
+	deadline := time.Now().Add(90 * time.Second)
+	for {
+		var busy int
+		err = pool.QueryRow(ctx, `SELECT (SELECT count(*) FROM work_items WHERE deployment_id=$1 AND status='running' AND lease_until>now())+(SELECT count(*) FROM outbox WHERE deployment_id=$1 AND status='sending' AND lease_until>now())`, cfg.DeploymentID).Scan(&busy)
+		if err != nil {
+			return errors.New("could not verify source worker drain")
+		}
+		if busy == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			return errors.New("source workers did not drain; source service and worker freeze were rolled back")
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(2 * time.Second):
+		}
+	}
+	callCtx, cancel := context.WithTimeout(ctx, 5*time.Minute)
+	defer cancel()
+	report, err := backup.CreateInstance(callCtx, pool, Root(), slug, archive)
+	if err != nil {
+		return err
+	}
+	if wasEnabled {
+		if err = systemctl("disable", unitName(slug)); err != nil {
+			return errors.New("backup was created but source bot boot startup could not be disabled")
+		}
+	}
+	resume = false
+	fmt.Printf("Complete backup created for deployment %s (%d table groups). Source bot remains stopped and backend workers frozen for cutover. Uncertain work: %d; uncertain outbox sends: %d. To roll back after stopping the target, use `xui-backend transfer resume %s --destination-stopped`.\n", report.Deployment, len(report.Counts), report.UncertainWorkItems, report.UncertainOutbox, slug)
+	return nil
+}
+
+func restoreInstance(parent context.Context, archive, slug string, dryRun bool) error {
+	if !validSlug(slug) {
+		return errors.New("invalid target instance slug")
+	}
+	manifest, archived, err := backup.InspectInstance(archive)
+	if err != nil {
+		return err
+	}
+	instanceDir := filepath.Join(Root(), slug)
+	localExists := false
+	if _, err = os.Stat(instanceDir); err == nil {
+		existing, readErr := Read(slug)
+		if readErr != nil || existing.DeploymentID != archived.Deployment {
+			return errors.New("target instance directory exists but does not match this archive")
+		}
+		localExists = true
+		if serviceIsActive(slug) {
+			return errors.New("target instance service is active; stop it before resuming restore")
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	if _, err = os.Stat(unitPath(slug)); err == nil && !localExists {
+		return errors.New("target instance service unit exists without matching local instance configuration")
+	} else if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	values, err := readEnvFile(backendEnvPath())
+	if err != nil {
+		return err
+	}
+	if values["DATABASE_URL"] == "" {
+		return errors.New("DATABASE_URL is missing from backend environment file")
+	}
+	targetURL, ok := localBackendURL(values["BACKEND_LISTEN_ADDR"])
+	if !ok {
+		return errors.New("target backend listen address is missing or invalid")
+	}
+	if err = checkBackendHealth(parent, targetURL); err != nil {
+		return err
+	}
+	pool, err := pgxpool.New(parent, values["DATABASE_URL"])
+	if err != nil {
+		return errors.New("cannot configure backend database connection")
+	}
+	defer pool.Close()
+	if err = pool.Ping(parent); err != nil {
+		return errors.New("cannot reach target backend database")
+	}
+	ctx, cancel := context.WithTimeout(parent, 5*time.Minute)
+	defer cancel()
+	report, err := backup.RestoreInstance(ctx, pool, archive, slug, values["BACKEND_PANEL_SECRETS_KEY"], true)
+	if err != nil {
+		return fmt.Errorf("instance restore preflight failed: %w", err)
+	}
+	if dryRun {
+		fmt.Printf("Instance restore preflight passed for deployment %s (%d table groups); target backend %s; panel identity collisions checked and required client/inbound readbacks matched.\n", report.Deployment, len(report.Counts), targetURL)
+		return nil
+	}
+	stage, err := backup.StagePortableInstanceConfig(archive, restoreStageRoot(), slug, targetURL, false)
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(filepath.Dir(stage))
+	configValues, err := readEnvFile(filepath.Join(stage, "instance.env"))
+	if err != nil {
+		return errors.New("could not read staged instance configuration")
+	}
+	cfg := Config{Slug: slug, Channel: configValues["CHANNEL"], DisplayName: configValues["DISPLAY_NAME"], DeploymentID: configValues["BACKEND_DEPLOYMENT_ID"], BackendURL: targetURL, BackendToken: configValues["BACKEND_TOKEN"], BotToken: configValues["TELEGRAM_BOT_TOKEN"], AdminID: parseID(configValues["ADMIN_TELEGRAM_ID"])}
+	if cfg.DeploymentID != report.Deployment || !validBackendURL(cfg.BackendURL) || !validTelegramToken(cfg.BotToken) || cfg.BackendToken == "" || cfg.AdminID <= 0 {
+		return errors.New("archived runtime identity failed validation")
+	}
+	if localExists {
+		existing, _ := Read(slug)
+		if existing.BackendToken != cfg.BackendToken || existing.BotToken != cfg.BotToken || existing.AdminID != cfg.AdminID || existing.Channel != cfg.Channel {
+			return errors.New("existing local instance credentials do not match the restore archive")
+		}
+	}
+	if unitData, readErr := os.ReadFile(unitPath(slug)); readErr == nil && string(unitData) != unitDefinition(cfg) {
+		return errors.New("existing target service unit differs from the expected instance unit")
+	} else if readErr != nil && !errors.Is(readErr, os.ErrNotExist) {
+		return readErr
+	}
+	if _, err = backup.RestoreInstance(ctx, pool, archive, slug, values["BACKEND_PANEL_SECRETS_KEY"], false); err != nil {
+		return fmt.Errorf("instance import or inactive-restore check failed: %w", err)
+	}
+	if err = save(cfg); err != nil {
+		return fmt.Errorf("database imported but frozen; local instance config could not be installed: %w", err)
+	}
+	if err = installUnit(cfg); err != nil {
+		return fmt.Errorf("database imported but frozen; service unit could not be installed: %w", err)
+	}
+	if err = systemctl("daemon-reload"); err != nil {
+		return err
+	}
+	if tag, updateErr := pool.Exec(ctx, `UPDATE deployments SET transfer_frozen=false WHERE id=$1 AND restore_fingerprint=$2 AND transfer_frozen=true`, cfg.DeploymentID, manifest.DataSHA256); updateErr != nil || tag.RowsAffected() != 1 {
+		verifyCtx, verifyCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer verifyCancel()
+		var stillFrozen bool
+		verifyErr := pool.QueryRow(verifyCtx, `SELECT transfer_frozen FROM deployments WHERE id=$1 AND restore_fingerprint=$2`, cfg.DeploymentID, manifest.DataSHA256).Scan(&stillFrozen)
+		if verifyErr != nil || !stillFrozen {
+			return fmt.Errorf("restore activation state is uncertain; keep the target bot stopped and verify transfer_frozen for deployment %s", cfg.DeploymentID)
+		}
+		return errors.New("database imported but frozen; could not enable backend authentication")
+	}
+	refreeze := func() error {
+		return (&store.Store{DB: pool}).RefreezeRestoredDeployment(context.Background(), cfg.DeploymentID, manifest.DataSHA256)
+	}
+	if err = checkBackendIdentity(ctx, cfg); err != nil {
+		_ = systemctl("stop", unitName(slug))
+		_ = systemctl("disable", unitName(slug))
+		if freezeErr := refreeze(); freezeErr != nil {
+			return fmt.Errorf("scoped authentication failed and freeze is uncertain; stop target service and verify transfer_frozen for deployment %s: %w", cfg.DeploymentID, freezeErr)
+		}
+		return errors.New("database imported but frozen; scoped backend authentication failed")
+	}
+	if err = systemctl("enable", "--now", unitName(slug)); err != nil {
+		_ = systemctl("stop", unitName(slug))
+		_ = systemctl("disable", unitName(slug))
+		if freezeErr := refreeze(); freezeErr != nil {
+			return fmt.Errorf("bot service did not start and freeze is uncertain; stop target service and verify transfer_frozen for deployment %s: %w", cfg.DeploymentID, freezeErr)
+		}
+		return fmt.Errorf("database imported but frozen; bot service did not start: %w", err)
+	}
+	if !serviceIsActive(slug) {
+		_ = systemctl("stop", unitName(slug))
+		_ = systemctl("disable", unitName(slug))
+		if freezeErr := refreeze(); freezeErr != nil {
+			return fmt.Errorf("bot service did not remain active and freeze is uncertain; stop target service and verify transfer_frozen for deployment %s: %w", cfg.DeploymentID, freezeErr)
+		}
+		return errors.New("database imported but frozen; bot service did not remain active")
+	}
+	if err = checkBackendIdentity(ctx, cfg); err != nil {
+		_ = systemctl("stop", unitName(slug))
+		_ = systemctl("disable", unitName(slug))
+		if freezeErr := refreeze(); freezeErr != nil {
+			return fmt.Errorf("post-start authentication failed and freeze is uncertain; stop target service and verify transfer_frozen for deployment %s: %w", cfg.DeploymentID, freezeErr)
+		}
+		return errors.New("database imported but frozen; post-start scoped authentication failed")
+	}
+	if err = releaseSafeDeployment(ctx, pool, cfg.DeploymentID); err != nil {
+		return fmt.Errorf("instance started but safe pending work release failed: %w", err)
+	}
+	fmt.Printf("Instance %s restored and active against %s. Uncertain work items and notifications remain quarantined for review.\n", slug, targetURL)
 	return nil
 }
 
@@ -556,6 +1132,56 @@ func validTelegramToken(s string) bool {
 func validBackendURL(raw string) bool {
 	u, err := url.ParseRequestURI(strings.TrimSpace(raw))
 	return err == nil && (u.Scheme == "https" || u.Scheme == "http") && u.Host != "" && u.User == nil && u.RawQuery == "" && u.Fragment == ""
+}
+
+func validBackendTransport(raw string) bool {
+	if !validBackendURL(raw) {
+		return false
+	}
+	u, err := url.ParseRequestURI(raw)
+	return err == nil && (u.Scheme == "https" || isLocalBackend(raw))
+}
+
+func checkBackendHealth(parent context.Context, base string) error {
+	ctx, cancel := context.WithTimeout(parent, 5*time.Second)
+	defer cancel()
+	client := &http.Client{Timeout: 5 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimRight(base, "/")+"/healthz", nil)
+	if err != nil {
+		return errors.New("backend health check could not be constructed")
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return errors.New("backend URL did not respond to health check")
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+	if resp.StatusCode != http.StatusOK {
+		return errors.New("backend URL health check returned a non-success status")
+	}
+	return nil
+}
+
+func checkBackendIdentity(parent context.Context, cfg Config) error {
+	ctx, cancel := context.WithTimeout(parent, 5*time.Second)
+	defer cancel()
+	client := &http.Client{Timeout: 5 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimRight(cfg.BackendURL, "/")+"/v1/admin/config", nil)
+	if err != nil {
+		return errors.New("backend identity check could not be constructed")
+	}
+	req.Header.Set("Authorization", "Bearer "+cfg.BackendToken)
+	req.Header.Set("X-Actor-Telegram-ID", strconv.FormatInt(cfg.AdminID, 10))
+	resp, err := client.Do(req)
+	if err != nil {
+		return errors.New("registered backend credential did not authenticate")
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+	if resp.StatusCode != http.StatusOK {
+		return errors.New("registered backend credential or administrator identity was rejected")
+	}
+	return nil
 }
 
 func mask(s string) string {
@@ -817,7 +1443,7 @@ func unitPath(slug string) string {
 }
 
 func installUnit(cfg Config) error {
-	content := fmt.Sprintf("[Unit]\nDescription=xui-backend bot instance %s\nAfter=network-online.target xui-backend.service\nWants=network-online.target\n\n[Service]\nType=simple\nExecStart=/usr/local/bin/xui-backend run-instance %s\nRestart=on-failure\nRestartSec=5\nUser=xui-backend\nGroup=xui-backend\nUMask=0077\nNoNewPrivileges=true\nPrivateTmp=true\nProtectSystem=strict\nProtectHome=true\n\n[Install]\nWantedBy=multi-user.target\n", cfg.Slug, cfg.Slug)
+	content := unitDefinition(cfg)
 	path := unitPath(cfg.Slug)
 	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
 		return err
@@ -828,6 +1454,10 @@ func installUnit(cfg Config) error {
 	return nil
 }
 
+func unitDefinition(cfg Config) string {
+	return fmt.Sprintf("[Unit]\nDescription=xui-backend bot instance %s\nAfter=network-online.target xui-backend.service\nWants=network-online.target\n\n[Service]\nType=simple\nExecStart=/usr/local/bin/xui-backend run-instance %s\nRestart=on-failure\nRestartSec=5\nUser=xui-backend\nGroup=xui-backend\nUMask=0077\nNoNewPrivileges=true\nPrivateTmp=true\nProtectSystem=strict\nProtectHome=true\n\n[Install]\nWantedBy=multi-user.target\n", cfg.Slug, cfg.Slug)
+}
+
 func systemctl(args ...string) error {
 	cmd := exec.Command("systemctl", args...)
 	output, err := cmd.CombinedOutput()
@@ -835,4 +1465,47 @@ func systemctl(args ...string) error {
 		return fmt.Errorf("systemctl %s failed: %s", strings.Join(args, " "), strings.TrimSpace(string(output)))
 	}
 	return nil
+}
+
+func serviceIsActive(slug string) bool {
+	return serviceStatus(slug) == "active"
+}
+
+func serviceStatus(slug string) string {
+	cmd := exec.Command("systemctl", "is-active", unitName(slug))
+	output, _ := cmd.CombinedOutput()
+	status := strings.TrimSpace(string(output))
+	if status == "" {
+		return "unknown"
+	}
+	return status
+}
+
+func serviceIsEnabled(slug string) (bool, bool) {
+	cmd := exec.Command("systemctl", "is-enabled", unitName(slug))
+	output, _ := cmd.CombinedOutput()
+	switch strings.TrimSpace(string(output)) {
+	case "enabled":
+		return true, true
+	case "disabled":
+		return false, true
+	default:
+		return false, false
+	}
+}
+
+func transferStatePath(slug string) string {
+	return filepath.Join(Root(), slug, "transfer-state.json")
+}
+
+func readTransferState(slug string) (transferState, error) {
+	var state transferState
+	data, err := os.ReadFile(transferStatePath(slug))
+	if err != nil {
+		return state, err
+	}
+	if err = json.Unmarshal(data, &state); err != nil || state.DeploymentID == "" {
+		return transferState{}, errors.New("invalid source transfer state")
+	}
+	return state, nil
 }
