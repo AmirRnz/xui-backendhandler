@@ -22,4 +22,10 @@
 
 - Write small, idiomatic Go changes with explicit dependencies, handled errors, bounded inputs/timeouts, parameterized SQL, versioned migrations, and graceful shutdown. Avoid hidden globals, ignored errors, normal-flow panics, and unrelated rewrites.
 - Test behavior at relevant boundaries: isolation, authorization, concurrency/idempotency, failure recovery, and uncertain panel outcomes. Use a disposable PostgreSQL 16 database and mocked Telegram/3x-ui; skipped DB tests are not passes. For changed Go code run `gofmt`, `go vet ./...`, `go test -count=1 -p 1 ./...`, and `go build ./...`; add race tests where supported.
-- Touch live systems only when requested. Verify current state first; migrations/restores need a validated backup, dry run, collision report, cutover sequence, and rollback. Protect secrets and backup archives. Report changes, tests run/skipped, and remaining risks concisely.
+
+## GitHub and VPS delivery
+
+- The user's normal delivery for runnable changes intended for the VPS is: finish and verify the change, commit and push a feature branch to GitHub, merge the reviewed commit into `main`, then fetch/pull that exact `main` commit on the intended VPS and update it. Do not stop after pushing unless the user asks to skip deployment. Docs-only changes do not need a VPS update.
+- Before a live update, inspect the target checkout, commit, database/schema, active backend and instance units, and backup destination. Follow the complete staging, backup, rehearsal, and maintenance cutover in `docs/BACKUP.md`. `upgrade.sh` stages and rehearses; it does not deploy by itself. Update only the intended xui-backend services; do not restart legacy services.
+- After deployment, verify the VPS is on the intended commit, the affected units are active, and backend health and scoped access work. Keep the prior verified backup and rollback path until checks pass. If access, backup, rehearsal, or rollback prerequisites are unavailable, stop before changing the live system and report the blocker.
+- Keep secrets out of Git, logs, output, and handoffs. Preserve user changes; never force-push or use destructive cleanup. Report changes, tests run/skipped, deployment verification, and remaining risks concisely.
