@@ -30,7 +30,7 @@ The importer stores `(source_instance, entity_type, legacy_id)` as the source ke
 
 ## Stage 2: dry-run source archive
 
-Run one source at a time from `xui-backend/`, with an account that can only read the legacy database. The source connection is forced read-only by the CLI. The target database must already have the migrations applied.
+Run one source at a time from the repository root, with an account that can only read the legacy database. The source connection is forced read-only by the CLI. The target database must already have the migrations applied.
 
 ```powershell
 $env:LEGACY_DATABASE_URL = 'postgres://legacy_reader:...@legacy-host:5432/legacy_db?sslmode=verify-full'

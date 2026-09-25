@@ -2,9 +2,20 @@
 
 This Go service is the single authority for commerce, identity, trials, subscriptions, 3x-ui access, reconciliation work, and durable notifications. Telegram adapters authenticate with one deployment-scoped bearer token and send the Telegram actor ID separately. Only this repository connects to PostgreSQL or 3x-ui.
 
-Deployment/client-service, commercial-account, and actor/role are separate records. Actors have a scoped identity provider and external subject; Telegram is the only currently authenticated provider, while the schema can represent future web/service actors. Reseller accounts can own child `reseller_customer` accounts for future reseller-owned end-user clients. Those later clients and their business rules are not implemented here.
+Deployment/client-service, commercial-account, and actor/role are separate records. The end-user bot serves retail customers buying and managing their own services. The reseller bot serves reseller accounts buying and managing services for their customers, with separate approval and trial rules. Multiple instances of either bot can use distinct Telegram tokens, admins, panels, and commercial data. Reseller-owned end-user bots and the reseller web panel are future products, not implemented here.
 
-The schema seeds three isolated deployments: `retail-finland`, `retail-germany`, and `reseller-turk1`. Configure each deployment's real panel URL and each panel's API token before any provisioning. Seeded `.invalid` URLs are intentionally nonfunctional placeholders. Set the exact tested panel API version to `3.8.5`; writes are denied for other versions until compatibility is verified.
+The schema seeds three isolated deployments: `retail-finland`, `retail-germany`, and `reseller-turk1`; the CLI can register additional instances. Configure each deployment's real panel URL and each panel's API token before any provisioning. Seeded `.invalid` URLs are intentionally nonfunctional placeholders. Set the exact tested panel API version to `3.8.5`; writes are denied for other versions until compatibility is verified.
+
+## Installer and instance menu
+
+From a reviewed checkout containing `install.sh`, on a Linux host with systemd, Go 1.25+, and PostgreSQL 16:
+
+```sh
+sudo ./install.sh
+sudo xui-backend
+```
+
+`xui-backend` without arguments opens the operator menu. It can add end-user or reseller bot instances, start/stop/restart/remove their services, and create or restore instance or global backups. Adding an instance asks for its Telegram token and admin ID, 3x-ui panel URL and API token, and backend URL; a local backend URL is suggested from the configured listen port. Removing a bot revokes its API credential but retains its accounts and commerce history. See [installer and backup/restore](docs/BACKUP.md) before moving or restoring data. There is no published remote one-line installer yet.
 
 ## Local run
 
@@ -13,17 +24,17 @@ Use Go 1.25+ and PostgreSQL 16. Create a local database, copy `config.example.en
 ```powershell
 docker run --name xui-commerce-dev -e POSTGRES_DB=xui_commerce -e POSTGRES_USER=xui_app -e POSTGRES_PASSWORD=local-only -p 5432:5432 -d postgres:16
 $env:DATABASE_URL = 'postgres://xui_app:local-only@127.0.0.1:5432/xui_commerce?sslmode=disable'
-go run ./cmd/backend migrate
+go run ./cmd/xui-backend migrate
 ```
 
 PowerShell does not automatically load `.env`; export its entries into the current process before serving:
 
 ```powershell
 Get-Content .env | Where-Object { $_ -and -not $_.StartsWith('#') } | ForEach-Object { $name, $value = $_.Split('=', 2); [Environment]::SetEnvironmentVariable($name, $value, 'Process') }
-go run ./cmd/backend serve
+go run ./cmd/xui-backend serve
 ```
 
-Run each Telegram adapter separately with the token for its deployment. The two retail deployments must use separate bot processes and scoped credentials even though they share the same adapter code.
+Each installed bot instance runs as a separate process with its own scoped credentials. The two seeded retail deployments remain isolated even though they share the same end-user adapter code.
 
 Administrators can manage plans, payment instructions, trial settings, reseller approval policy, bot text/features, and the deployment's default panel through `/v1/admin/config`. The Telegram identity `96937669` is migrated as admin only for `retail-finland` and `reseller-turk1`; Germany remains separate. Admin writes are deployment-scoped and audited. The public `/v1/features` endpoint gives bots the corresponding deployment's feature/text configuration.
 
