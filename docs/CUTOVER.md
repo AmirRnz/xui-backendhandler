@@ -2,6 +2,10 @@
 
 This runbook has a tested raw archive step and a blocked canonical conversion step. The archive preserves source material and review obligations; it does not make subscriptions or balances live in the new system. Do not cut over a deployment until the conversion blockers below are cleared in a separately reviewed implementation.
 
+## Current Finland runtime
+
+As of 2026-09-25, the Finland backend is running the unified system with migrations 001–014. At its last sync, the source checkout at `/root/xui-backendhandler` was locally clean on `main` at `9e77846`; GitHub `main` is now `cf3a34b`, and commits since that VPS sync are documentation-only, so the deployed `/usr/local/bin/xui-backend` remains the code-only release at `c19f8df`. `xui-backend.service` and `xui-backend-instance-kitten.service` are active, and the previous binary is retained in protected rollback storage. This code-only update did not complete the legacy data conversion described below. At the last inspection, no off-host backup mount or protected rehearsal env file containing `DRY_RUN_DATABASE_URL` was found; `upgrade.sh` still accepts only schema 012 and must not be used against this schema-014 host.
+
 ## Preserve three independent sources
 
 Use the source identifiers exactly as follows:
@@ -23,7 +27,7 @@ The importer stores `(source_instance, entity_type, legacy_id)` as the source ke
 
 ## Stage 1: backend preparation
 
-1. Provision a separate PostgreSQL 16 database and apply `go run ./cmd/backend migrate`.
+1. Provision a separate PostgreSQL 16 database and apply `go run ./cmd/xui-backend migrate`.
 2. Verify `client_services`, the three deployment rows, and panel rows. Change seeded `.invalid` panel URLs only after matching each source deployment to the correct panel. Configure backend bearer credentials, panel API tokens, and Telegram bot tokens outside source control.
 3. Bootstrap plans, scoped actors/roles, deployment payment instructions, panel identity maps, and admin accounts only from reviewed source data. The current archive command does not do this canonical data conversion.
 4. Verify the exact 3x-ui version. Write access is gated to 3.8.5. The supplied spec says 3.x; no broader version support is assumed.

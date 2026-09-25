@@ -446,6 +446,30 @@ func releaseSafeDeployment(ctx context.Context, pool *pgxpool.Pool, deployment s
 	return nil
 }
 
+func unfreezeRestoredDeployment(ctx context.Context, pool *pgxpool.Pool, deployment, fingerprint string) (restoredUnfreezeState, error) {
+	tag, err := pool.Exec(ctx, `UPDATE deployments SET transfer_frozen=false WHERE id=$1 AND restore_fingerprint=$2 AND transfer_frozen=true`, deployment, fingerprint)
+	if err == nil && tag.RowsAffected() == 1 {
+		return restoredUnfreezeUnfrozen, nil
+	}
+	verifyCtx, verifyCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer verifyCancel()
+	var stillFrozen bool
+	verifyErr := pool.QueryRow(verifyCtx, `SELECT transfer_frozen FROM deployments WHERE id=$1 AND restore_fingerprint=$2`, deployment, fingerprint).Scan(&stillFrozen)
+	if verifyErr != nil {
+		return restoredUnfreezeUnknown, fmt.Errorf("restore activation state is uncertain; final transfer-freeze state could not be read for deployment %s", deployment)
+	}
+	if !stillFrozen {
+		if err != nil {
+			return restoredUnfreezeUnfrozen, fmt.Errorf("final transfer-freeze update reported an error after activation became visible; activation may already be visible: %w", err)
+		}
+		return restoredUnfreezeUnfrozen, errors.New("final transfer-freeze update did not change the restored deployment, but activation is already visible")
+	}
+	if err != nil {
+		return restoredUnfreezeFrozen, fmt.Errorf("transfer freeze update failed; deployment remains frozen: %w", err)
+	}
+	return restoredUnfreezeFrozen, errors.New("transfer freeze update did not change the restored deployment; deployment remains frozen")
+}
+
 func (m menu) add(ctx context.Context) error {
 	channel, err := m.ask("Bot type (end-user/reseller): ")
 	if err != nil {
@@ -1031,53 +1055,41 @@ func restoreInstance(parent context.Context, archive, slug string, dryRun bool) 
 	if err = systemctl("daemon-reload"); err != nil {
 		return err
 	}
-	if tag, updateErr := pool.Exec(ctx, `UPDATE deployments SET transfer_frozen=false WHERE id=$1 AND restore_fingerprint=$2 AND transfer_frozen=true`, cfg.DeploymentID, manifest.DataSHA256); updateErr != nil || tag.RowsAffected() != 1 {
-		verifyCtx, verifyCancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer verifyCancel()
-		var stillFrozen bool
-		verifyErr := pool.QueryRow(verifyCtx, `SELECT transfer_frozen FROM deployments WHERE id=$1 AND restore_fingerprint=$2`, cfg.DeploymentID, manifest.DataSHA256).Scan(&stillFrozen)
-		if verifyErr != nil || !stillFrozen {
-			return fmt.Errorf("restore activation state is uncertain; keep the target bot stopped and verify transfer_frozen for deployment %s", cfg.DeploymentID)
-		}
-		return errors.New("database imported but frozen; could not enable backend authentication")
-	}
-	refreeze := func() error {
-		return (&store.Store{DB: pool}).RefreezeRestoredDeployment(context.Background(), cfg.DeploymentID, manifest.DataSHA256)
-	}
-	if err = checkBackendIdentity(ctx, cfg); err != nil {
-		_ = systemctl("stop", unitName(slug))
-		_ = systemctl("disable", unitName(slug))
-		if freezeErr := refreeze(); freezeErr != nil {
-			return fmt.Errorf("scoped authentication failed and freeze is uncertain; stop target service and verify transfer_frozen for deployment %s: %w", cfg.DeploymentID, freezeErr)
-		}
-		return errors.New("database imported but frozen; scoped backend authentication failed")
-	}
-	if err = systemctl("enable", "--now", unitName(slug)); err != nil {
-		_ = systemctl("stop", unitName(slug))
-		_ = systemctl("disable", unitName(slug))
-		if freezeErr := refreeze(); freezeErr != nil {
-			return fmt.Errorf("bot service did not start and freeze is uncertain; stop target service and verify transfer_frozen for deployment %s: %w", cfg.DeploymentID, freezeErr)
-		}
-		return fmt.Errorf("database imported but frozen; bot service did not start: %w", err)
-	}
-	if !serviceIsActive(slug) {
-		_ = systemctl("stop", unitName(slug))
-		_ = systemctl("disable", unitName(slug))
-		if freezeErr := refreeze(); freezeErr != nil {
-			return fmt.Errorf("bot service did not remain active and freeze is uncertain; stop target service and verify transfer_frozen for deployment %s: %w", cfg.DeploymentID, freezeErr)
-		}
-		return errors.New("database imported but frozen; bot service did not remain active")
-	}
-	if err = checkBackendIdentity(ctx, cfg); err != nil {
-		_ = systemctl("stop", unitName(slug))
-		_ = systemctl("disable", unitName(slug))
-		if freezeErr := refreeze(); freezeErr != nil {
-			return fmt.Errorf("post-start authentication failed and freeze is uncertain; stop target service and verify transfer_frozen for deployment %s: %w", cfg.DeploymentID, freezeErr)
-		}
-		return errors.New("database imported but frozen; post-start scoped authentication failed")
-	}
-	if err = releaseSafeDeployment(ctx, pool, cfg.DeploymentID); err != nil {
-		return fmt.Errorf("instance started but safe pending work release failed: %w", err)
+	backendStore := &store.Store{DB: pool}
+	if err = activateRestoredInstance(ctx, restoredActivationInput{
+		DeploymentID: cfg.DeploymentID,
+		Fingerprint:  manifest.DataSHA256,
+		Slug:         slug,
+		BackendToken: cfg.BackendToken,
+		AdminID:      cfg.AdminID,
+		BackendURL:   targetURL,
+	}, restoredActivationHooks{
+		AcquireTransferLease: func(leaseCtx context.Context, deployment string) (restoredActivationLease, error) {
+			return backendStore.AcquireDeploymentTransferLease(leaseCtx, deployment)
+		},
+		Refreeze: func(freezeCtx context.Context, deployment, fingerprint string) error {
+			return backendStore.RefreezeRestoredDeployment(freezeCtx, deployment, fingerprint)
+		},
+		Unfreeze: func(unfreezeCtx context.Context, deployment, fingerprint string) (restoredUnfreezeState, error) {
+			return unfreezeRestoredDeployment(unfreezeCtx, pool, deployment, fingerprint)
+		},
+		ReleaseSafe: func(releaseCtx context.Context, deployment string) error {
+			return releaseSafeDeployment(releaseCtx, pool, deployment)
+		},
+		ValidateHealth: checkBackendHealth,
+		StartBot: func(instanceSlug string) error {
+			return systemctl("enable", "--now", unitName(instanceSlug))
+		},
+		StopBot: func(instanceSlug string) {
+			_ = systemctl("stop", unitName(instanceSlug))
+			_ = systemctl("disable", unitName(instanceSlug))
+		},
+		BotActive: serviceIsActive,
+		ReportWarning: func(message string) {
+			fmt.Fprintf(os.Stderr, "Warning: %s\n", message)
+		},
+	}); err != nil {
+		return err
 	}
 	fmt.Printf("Instance %s restored and active against %s. Uncertain work items and notifications remain quarantined for review.\n", slug, targetURL)
 	return nil

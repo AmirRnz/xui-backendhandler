@@ -2,7 +2,9 @@ package store
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -29,6 +31,40 @@ func (l *DeploymentRequestLease) IsEnabled(ctx context.Context, requireBot bool,
 	var enabled bool
 	err := l.tx.QueryRow(ctx, query, deployment).Scan(&enabled)
 	return enabled, err
+}
+
+// ValidateRestoredAdmin verifies the restored bot credential and designated
+// administrator while the deployment is still transfer_frozen. Callers must
+// hold an exclusive deployment transfer lease for the whole activation
+// sequence. The normal HTTP authentication path intentionally rejects frozen
+// deployments, so restore activation uses this checked, lease-scoped probe
+// instead of making a request that would deadlock behind its own lease.
+func (l *DeploymentRequestLease) ValidateRestoredAdmin(ctx context.Context, deployment, token string, adminTelegramID int64) error {
+	if l == nil || l.tx == nil {
+		return errors.New("deployment lock is not active")
+	}
+	if deployment == "" || strings.TrimSpace(token) == "" || adminTelegramID <= 0 {
+		return ErrForbidden
+	}
+	digest := sha256.Sum256([]byte(strings.TrimSpace(token)))
+	var valid bool
+	err := l.tx.QueryRow(ctx, `SELECT EXISTS(
+		SELECT 1
+		FROM backend_client_credentials c
+		JOIN deployments d ON d.id=c.deployment_id
+		JOIN actors a ON a.deployment_id=d.id AND a.telegram_id=$3
+		JOIN commercial_accounts account ON account.id=a.account_id AND account.status='active'
+		WHERE c.token_hash=$1 AND c.deployment_id=$2 AND c.enabled
+		  AND d.enabled AND d.bot_instance_active AND d.transfer_frozen AND d.admin_telegram_id=$3
+		  AND a.role='admin' AND a.approval_status='approved' AND a.enabled
+	)`, digest[:], deployment, adminTelegramID).Scan(&valid)
+	if err != nil {
+		return err
+	}
+	if !valid {
+		return ErrForbidden
+	}
+	return nil
 }
 
 func (l *DeploymentRequestLease) Release(ctx context.Context) error {
