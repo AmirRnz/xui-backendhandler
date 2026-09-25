@@ -54,10 +54,13 @@ done
 [[ $((8#$(stat -c '%a' "$DRYRUN_ENV_FILE") & 077)) -eq 0 ]] || { echo "Dry-run database env file must not be accessible by group or other users." >&2; exit 1; }
 [[ -d "$INSTANCE_DIR" && ! -L "$INSTANCE_DIR" ]] || { echo "Managed instance directory is missing or unsafe." >&2; exit 1; }
 [[ -d "$BACKUP_ROOT" && ! -L "$BACKUP_ROOT" ]] || { echo "Backup destination must be an existing directory on a remote mount." >&2; exit 1; }
-[[ "$TESTING" == "1" || "$(stat -c '%U' "$BACKEND_ENV")" == root ]] || { echo "backend.env must be root-owned." >&2; exit 1; }
+backend_env_owner="$(stat -c '%U' "$BACKEND_ENV")"
+backend_env_group="$(stat -c '%G' "$BACKEND_ENV")"
+backend_env_mode="$(stat -c '%a' "$BACKEND_ENV")"
+[[ "$TESTING" == "1" || "$backend_env_owner" == root ]] || { echo "backend.env must be root-owned." >&2; exit 1; }
+[[ "$backend_env_mode" == 600 || ( "$backend_env_mode" == 640 && "$backend_env_group" == xui-backend ) ]] || { echo "backend.env must be mode 0600 or root:xui-backend mode 0640." >&2; exit 1; }
 [[ "$TESTING" == "1" || "$(stat -c '%U' "$DRYRUN_ENV_FILE")" == root ]] || { echo "Dry-run database env file must be root-owned." >&2; exit 1; }
 if [[ "$TESTING" != "1" ]]; then
-  [[ $((8#$(stat -c '%a' "$BACKEND_ENV") & 077)) -eq 0 ]] || { echo "backend.env must not be accessible by group or other users." >&2; exit 1; }
   grep -q '^# XUI_BACKEND_INSTALLER_MANAGED_DATABASE=1$' "$BACKEND_ENV" || { echo "This is not an installer-managed backend installation." >&2; exit 1; }
   case "$(findmnt -T "$BACKUP_ROOT" -n -o FSTYPE 2>/dev/null || true)" in nfs|nfs4|cifs|smb3|sshfs|fuse.sshfs) ;; *) echo "Backup directory must be on an NFS/CIFS/SSHFS remote mount." >&2; exit 1 ;; esac
 fi
@@ -178,6 +181,7 @@ mkdir -m 0700 -- "$backup_dir" || { echo "Could not create unique backup directo
 mkdir -m 0700 "$backup_dir/config" "$backup_dir/units" "$backup_dir/instances"
 pg_dump -Fc --no-owner --no-acl -f "$backup_dir/database.dump"
 chmod 0600 "$backup_dir/database.dump"
+pg_restore --list "$backup_dir/database.dump" >/dev/null || { echo "Off-host database dump could not be read back; no live services were changed." >&2; exit 1; }
 install -m 0600 "$BACKEND_ENV" "$backup_dir/config/backend.env"
 install -m 0755 "$BACKEND_BIN" "$backup_dir/xui-backend.previous"
 install -m 0644 "$BACKEND_UNIT" "$backup_dir/units/xui-backend.service"

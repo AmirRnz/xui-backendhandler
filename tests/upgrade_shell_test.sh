@@ -13,12 +13,13 @@ trap 'rm -rf -- "$tmp"' EXIT
 root="$tmp/root"
 bin="$tmp/bin"
 db_dir="$tmp/databases"
-mkdir -p "$root/usr/local/bin" "$root/etc/xui-backend/instances" "$root/etc/systemd/system" "$root/var/lib/xui-backend" "$root/backup-success" "$root/backup-failure" "$root/backup-drop-failure" "$root/source/cmd/xui-backend" "$bin" "$db_dir"
+mkdir -p "$root/usr/local/bin" "$root/etc/xui-backend/instances" "$root/etc/systemd/system" "$root/var/lib/xui-backend" "$root/backup-success" "$root/backup-failure" "$root/backup-drop-failure" "$root/backup-mode-0600" "$root/source/cmd/xui-backend" "$bin" "$db_dir"
 printf '#!/bin/sh\nexit 0\n' > "$root/usr/local/bin/xui-backend"
 chmod 0755 "$root/usr/local/bin/xui-backend"
 cat > "$root/etc/xui-backend/backend.env" <<'ENV'
 DATABASE_URL=postgres://source:src-secret@127.0.0.1:5432/source?sslmode=disable
 ENV
+chmod 0640 "$root/etc/xui-backend/backend.env"
 cat > "$root/etc/systemd/system/xui-backend.service" <<'UNIT'
 [Unit]
 Description=XUI Backend commerce authority
@@ -48,6 +49,7 @@ MOD
 printf 'DRY_RUN_DATABASE_URL=postgres://test:dry-secret@127.0.0.1:5432/postgres?sslmode=disable\n' > "$tmp/dry.env"
 chmod 0600 "$tmp/dry.env"
 python_real="$(command -v python3)"
+stat_real="$(command -v stat)"
 
 cat > "$bin/go" <<'MOCK'
 #!/usr/bin/env bash
@@ -101,11 +103,19 @@ cat > "$bin/python3" <<'MOCK'
 printf '%s\n' "$*" >> "$MOCK_PYTHON_ARGS"
 exec "$PYTHON_REAL" "$@"
 MOCK
+cat > "$bin/stat" <<'MOCK'
+#!/usr/bin/env bash
+if [[ "$1" == -c && "$2" == %G && "${@: -1}" == */etc/xui-backend/backend.env ]]; then
+  printf 'xui-backend\n'
+else
+  exec "$STAT_REAL" "$@"
+fi
+MOCK
 for name in systemctl pg_restore curl findmnt mv; do
   printf '#!/usr/bin/env bash\nexit 0\n' > "$bin/$name"
 done
 chmod 0700 "$bin"/*
-export MOCK_DB_DIR="$db_dir" MOCK_CREATED_NAME="$tmp/created-name" MOCK_PYTHON_ARGS="$tmp/python-args" PYTHON_REAL="$python_real"
+export MOCK_DB_DIR="$db_dir" MOCK_CREATED_NAME="$tmp/created-name" MOCK_PYTHON_ARGS="$tmp/python-args" PYTHON_REAL="$python_real" STAT_REAL="$stat_real"
 
 run_upgrade() {
   local backup="$1"; shift
@@ -121,6 +131,15 @@ fi
 clone="$(cat "$MOCK_CREATED_NAME")"
 [[ ! -e "$db_dir/$clone" && "$output" == *"Preflight passed"* ]]
 ! grep -q 'dry-secret' "$MOCK_PYTHON_ARGS"
+
+# A root-owned installer environment can use strict 0600 too.
+chmod 0600 "$root/etc/xui-backend/backend.env"
+if ! output="$(run_upgrade "$root/backup-mode-0600" 2>&1)"; then
+  echo "$output" >&2
+  exit 1
+fi
+clone="$(cat "$MOCK_CREATED_NAME")"
+[[ ! -e "$db_dir/$clone" && "$output" == *"Preflight passed"* ]]
 
 # A migration failure still drops the clone through the EXIT cleanup trap.
 set +e
@@ -144,4 +163,12 @@ output="$(run_upgrade "$root/backup-failure" 2>&1)"
 status=$?
 set -e
 [[ $status -ne 0 && "$output" == *"must not be accessible by group or other users"* ]]
+
+chmod 0600 "$tmp/dry.env"
+chmod 0644 "$root/etc/xui-backend/backend.env"
+set +e
+output="$(run_upgrade "$root/backup-failure" 2>&1)"
+status=$?
+set -e
+[[ $status -ne 0 && "$output" == *"backend.env must be mode 0600 or root:xui-backend mode 0640"* ]]
 echo "upgrade shell integration checks passed"
