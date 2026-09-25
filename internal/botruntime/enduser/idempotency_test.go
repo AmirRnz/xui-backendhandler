@@ -11,7 +11,7 @@ import (
 )
 
 func TestAdminConfigDecodesBackendStringIdentifiers(t *testing.T) {
-	const response = `{"deployment_id":"retail-finland","channel":"retail-finland","plans":[],"payment_instructions":{},"settings":{"retail_trial_reset_days":0,"features":{},"text":{}},"panel":{"id":"panel-retail-finland","base_url":"https://panel.example.test","token_configured":false}}`
+	const response = `{"deployment_id":"retail-finland","channel":"retail","plans":[],"payment_instructions":{},"settings":{"retail_trial_reset_days":0,"features":{},"text":{}},"panel":{"id":"panel-retail-finland","base_url":"https://panel.example.test","token_configured":false}}`
 	var cfg adminConfig
 	if err := json.Unmarshal([]byte(response), &cfg); err != nil {
 		t.Fatalf("decode backend admin config: %v", err)

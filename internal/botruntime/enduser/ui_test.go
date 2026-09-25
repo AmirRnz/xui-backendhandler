@@ -519,7 +519,7 @@ func TestAdminReceiptViewAndConfirmedRejectUsePrivateBackendRoutes(t *testing.T)
 		case "/v1/actors/resolve":
 			_, _ = w.Write([]byte(`{"telegram_id":96937669,"role":"admin"}`))
 		case "/v1/admin/config":
-			_, _ = w.Write([]byte(`{"channel":"retail-finland"}`))
+			_, _ = w.Write([]byte(`{"channel":"retail"}`))
 		case "/v1/admin/payments":
 			_, _ = w.Write([]byte(`[{"id":12,"telegram_id":42,"amount_toman":120000,"status":"receipt_submitted","telegram_file_id":"evidence-file"}]`))
 		case "/v1/admin/topups":
@@ -636,7 +636,7 @@ func TestAdminPendingReceiptListsPaginateBeyondTenWithoutDecisionButtons(t *test
 		case "/v1/actors/resolve":
 			_, _ = w.Write([]byte(`{"telegram_id":96937669,"role":"admin"}`))
 		case "/v1/admin/config":
-			_, _ = w.Write([]byte(`{"channel":"retail-finland"}`))
+			_, _ = w.Write([]byte(`{"channel":"retail"}`))
 		case "/v1/admin/payments":
 			listCalls++
 			items := make([]pendingReceiptView, 12)

@@ -2449,8 +2449,8 @@ func (a *botApp) requireRetailAdmin(c telebot.Context) (actor, error) {
 	if err = a.api.Call(ctx, "GET", "/v1/admin/config", act.TelegramID, nil, &cfg); err != nil {
 		return act, err
 	}
-	if cfg.Channel != "retail-finland" {
-		return act, fmt.Errorf("retail administration is restricted to the retail-finland deployment")
+	if cfg.Channel != "retail" {
+		return act, fmt.Errorf("retail administration is restricted to retail deployments")
 	}
 	return act, nil
 }
@@ -2463,8 +2463,8 @@ func (a *botApp) loadConfig(c telebot.Context) (adminConfig, error) {
 	defer cancel()
 	var cfg adminConfig
 	err = a.api.Call(ctx, "GET", "/v1/admin/config", act.TelegramID, nil, &cfg)
-	if err == nil && cfg.Channel != "retail-finland" {
-		err = fmt.Errorf("retail configuration is restricted to the retail-finland deployment")
+	if err == nil && cfg.Channel != "retail" {
+		err = fmt.Errorf("retail configuration is restricted to retail deployments")
 	}
 	return cfg, err
 }
