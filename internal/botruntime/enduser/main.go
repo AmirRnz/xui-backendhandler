@@ -293,7 +293,8 @@ func (a *botApp) state(user int64) conversation {
 	defer a.mu.Unlock()
 	st := a.states[user]
 	if st.Nonce == "" || time.Since(st.Updated) > 30*time.Minute {
-		st = conversation{Nonce: newNonce()}
+		st = conversation{Nonce: newNonce(), Updated: time.Now()}
+		a.states[user] = st
 	}
 	return st
 }
@@ -619,6 +620,9 @@ func (a *botApp) homeView(c telebot.Context, message string) (string, *telebot.R
 		rows = append(rows, m.Row(service))
 	}
 	rows = append(rows, m.Row(m.Data(menuText(features, "menu_support", "🆘 پشتیبانی"), "nav", st.Nonce, "support")))
+	if act.Role == "admin" && adminCommandSender(c.Sender(), c.Chat()) {
+		rows = append(rows, m.Row(m.Data("⚙️ مدیریت", "nav", st.Nonce, "admin")))
+	}
 	m.Inline(rows...)
 	if custom := strings.TrimSpace(features.Text["welcome"]); custom != "" && (message == "صفحه اصلی" || strings.Contains(message, "به پنل کاربری خوش آمدید")) {
 		message = custom
@@ -1452,12 +1456,15 @@ func (a *botApp) text(c telebot.Context) error {
 		return nil
 	}
 	st := a.state(c.Sender().ID)
-	if st.Step == "" {
+	if st.Step == "" && st.Admin == "" {
 		return c.Send("برای ادامه یکی از گزینه‌های منو را انتخاب کنید.")
 	}
 	value := strings.TrimSpace(c.Text())
 	if value == "" {
 		return c.Send("ورودی خالی است. لطفاً دوباره بفرستید.")
+	}
+	if st.Admin != "" {
+		return a.adminTextInput(c, st, value)
 	}
 	switch st.Step {
 	case "purchase-months":
@@ -1501,9 +1508,6 @@ func (a *botApp) text(c telebot.Context) error {
 		}
 		return a.createRefundRequest(c, st, value)
 	default:
-		if st.Admin != "" {
-			return a.adminTextInput(c, st, value)
-		}
 		return c.Send("این مرحله منقضی شده است. از منو دوباره شروع کنید.")
 	}
 }
@@ -2693,12 +2697,13 @@ func (a *botApp) createPlan(c telebot.Context, p *adminPlan) error {
 	if err = a.api.Call(ctx, "POST", "/v1/admin/config/plans", act.TelegramID, p, &result); err != nil {
 		return sendFailure(c, err)
 	}
+	a.resetPlanEditorState(c)
 	for _, created := range result.Config.Plans {
 		if created.ID == result.ID {
-			return a.planEditor(c, created, false)
+			return a.planEditor(c, created, c.Callback() != nil)
 		}
 	}
-	return a.adminPlans(c, false)
+	return a.adminPlans(c, c.Callback() != nil)
 }
 func (a *botApp) updatePlan(c telebot.Context, p adminPlan) error {
 	act, err := a.requireRetailAdmin(c)
@@ -2711,12 +2716,22 @@ func (a *botApp) updatePlan(c telebot.Context, p adminPlan) error {
 	if err = a.api.Call(ctx, "PUT", fmt.Sprintf("/v1/admin/config/plans/%d", p.ID), act.TelegramID, p, &cfg); err != nil {
 		return sendFailure(c, err)
 	}
+	a.resetPlanEditorState(c)
 	for _, updated := range cfg.Plans {
 		if updated.ID == p.ID {
-			return a.planEditor(c, updated, false)
+			return a.planEditor(c, updated, c.Callback() != nil)
 		}
 	}
-	return a.adminPlans(c, false)
+	return a.adminPlans(c, c.Callback() != nil)
+}
+
+func (a *botApp) resetPlanEditorState(c telebot.Context) {
+	st := a.state(c.Sender().ID)
+	st.Step = ""
+	st.Admin = ""
+	st.AdminID = 0
+	st.Draft = nil
+	a.setState(c.Sender().ID, st)
 }
 func (a *botApp) adminPayment(c telebot.Context, edit bool) error {
 	cfg, err := a.loadConfig(c)
