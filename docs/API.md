@@ -44,11 +44,12 @@ The designated admin identity and deployment scope are checked in the backend on
 | `POST /v1/admin/refunds/{id}/reject` | empty object | Rejects a pending refund without restoring a subscription or crediting the wallet; replay returns `already_rejected: true` |
 | `GET /v1/admin/work-items` | none | Durable work needing operational attention |
 | `GET /v1/admin/config` | admin actor header | Deployment-scoped plan catalog, payment instructions, settings, and panel URL/configured status; never includes a panel token |
+| `GET /v1/admin/panels/inbounds` | admin actor header | Authenticated 3x-ui inbound picker (`id`, `remark`, `tag`, `protocol`, `port`, `enable`) for building plans; uses the panel token configured for this deployment |
 | `GET /v1/admin/resellers/pending` | admin actor header | Pending reseller accounts in this reseller deployment only |
 | `POST /v1/admin/resellers/{telegram_id}/approve` | `{}` | Approves a pending reseller in this deployment; action and admin actor are audited in the same transaction |
 | `POST /v1/admin/resellers/{telegram_id}/reject` | `{}` | Rejects a reseller in this deployment; action and admin actor are audited in the same transaction |
-| `POST /v1/admin/config/plans` | full plan object, without `id` | Creates a deployment-owned plan and returns `{id,config}` |
-| `PUT /v1/admin/config/plans/{id}` | full plan object | Updates only a plan owned by this deployment and returns refreshed config |
+| `POST /v1/admin/config/plans` | full plan object, without `id`; optional `allowed_telegram_ids` | Creates a deployment-owned plan and returns `{id,config}`; an empty allowlist makes the plan available to all accounts in the deployment |
+| `PUT /v1/admin/config/plans/{id}` | full plan object; optional `allowed_telegram_ids` | Updates only a plan owned by this deployment and returns refreshed config; omitted allowlist preserves existing grants |
 | `PATCH /v1/admin/config/payment-instructions` | `card_number, card_owner, instructions` | Replaces this deployment's payment instructions |
 | `PATCH /v1/admin/config/settings` | any subset of `retail_trial_reset_days, unapproved_trial_daily_limit, min_topup_toman, reseller_approved_required, features, text` | Updates trial controls, minimum wallet top-up (Toman; `0` disables it), reseller approval requirement, feature flags, and user-facing text |
 | `PUT /v1/admin/config/panel` | `base_url, token` | Updates the deployment's default panel. Token is encrypted at rest and never returned; requires `BACKEND_PANEL_SECRETS_KEY` |
@@ -59,4 +60,4 @@ The backend has no public “set wallet” operation. Financial writes use audit
 
 ## 3x-ui integration behavior
 
-Only the backend worker calls 3x-ui. API token material comes from `XUI_PANEL_TOKENS_JSON`, keyed by panel ID. The worker requires version `3.8.5`; client updates read and preserve the full remote row. Adds/updates/attaches that are partial or ambiguous are read back and reconciled before any retry. Provisioning obligations are committed before the external call.
+Only the backend worker calls 3x-ui. API token material comes from `XUI_PANEL_TOKENS_JSON`, keyed by panel ID. The worker requires version `3.8.5`; client updates read and preserve the full remote row. Adds/updates/attaches that are partial or ambiguous are read back and reconciled before any retry. Provisioning obligations are committed before the external call. Retail device caps are stored as customer terms in the subscription record; new panel clients use `limitIp=0` and carry a legacy-compatible `devices: N` marker in the comment so older admin tooling can still read the configured cap.

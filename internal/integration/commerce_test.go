@@ -401,6 +401,7 @@ func TestRefundUsesImmutablePaidCapAndManualLegacyReview(t *testing.T) {
 
 type fakePanel struct {
 	remote                *xui.RemoteClient
+	lastAdd               *xui.ClientConfig
 	outcome               xui.Outcome
 	createOnUnknown       bool
 	addCalls, attachCalls int
@@ -417,8 +418,10 @@ func (p *fakePanel) GetClient(_ context.Context, email string) (*xui.RemoteClien
 }
 func (p *fakePanel) Add(_ context.Context, c xui.ClientConfig, inbounds []int) xui.WriteResult {
 	p.addCalls++
+	config := c
+	p.lastAdd = &config
 	if p.outcome == xui.Succeeded || p.outcome == xui.Unknown && p.createOnUnknown {
-		p.remote = &xui.RemoteClient{UUID: c.ID, Email: c.Email, SubID: c.SubID, Enable: c.Enable, ExpiryTime: c.ExpiryTime, LimitIP: c.LimitIP, TotalGB: c.TotalGB, LimitHWID: c.LimitHWID, InboundIDs: []int{inbounds[0]}}
+		p.remote = &xui.RemoteClient{UUID: c.ID, Email: c.Email, SubID: c.SubID, Enable: c.Enable, ExpiryTime: c.ExpiryTime, LimitIP: c.LimitIP, TotalGB: c.TotalGB, LimitHWID: c.LimitHWID, Comment: c.Comment, TgID: c.TgID, Flow: c.Flow, InboundIDs: []int{inbounds[0]}}
 	}
 	return xui.WriteResult{Outcome: p.outcome, Err: p.addErr}
 }
@@ -460,6 +463,10 @@ func TestPartialInboundAndCrashAfterRemoteSuccessRecoverWithoutDuplicateAdd(t *t
 	if panel.addCalls != 1 || panel.attachCalls != 1 {
 		t.Fatalf("partial repair did not use readback: add=%d attach=%d", panel.addCalls, panel.attachCalls)
 	}
+	wantComment := xui.CustomerClientComment("recovery-plan", a.TelegramID, 1)
+	if panel.lastAdd == nil || panel.lastAdd.LimitIP != 0 || panel.lastAdd.Comment != wantComment || panel.remote.LimitIP != 0 || panel.remote.Comment != wantComment {
+		t.Fatalf("retail device cap must stay in the legacy-compatible comment while 3x-ui limitIp stays disabled: add=%+v remote=%+v", panel.lastAdd, panel.remote)
+	}
 	var subStatus string
 	var links string
 	if err = s.DB.QueryRow(ctx, `SELECT status,subscription_links::text FROM subscriptions WHERE id=$1`, purchase.SubscriptionID).Scan(&subStatus, &links); err != nil {
@@ -491,7 +498,7 @@ func TestPartialInboundAndCrashAfterRemoteSuccessRecoverWithoutDuplicateAdd(t *t
 	if err != nil {
 		t.Fatal(err)
 	}
-	panel.remote = &xui.RemoteClient{UUID: uuid, Email: email, SubID: subid, Enable: true, ExpiryTime: expiry, LimitIP: ip, TotalGB: limit, Flow: flow, InboundIDs: []int{1, 2}}
+	panel.remote = &xui.RemoteClient{UUID: uuid, Email: email, SubID: subid, Enable: true, ExpiryTime: expiry, LimitIP: 0, TotalGB: limit, Flow: flow, Comment: xui.CustomerClientComment(comment, tg, ip), TgID: tg, InboundIDs: []int{1, 2}}
 	if _, err = s.DB.Exec(ctx, `UPDATE work_items SET status='running',phase='create_attempted',lease_until=now()-interval '1 second' WHERE id=$1`, workID); err != nil {
 		t.Fatal(err)
 	}

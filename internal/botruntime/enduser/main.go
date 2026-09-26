@@ -157,6 +157,7 @@ type conversation struct {
 	AdminReceiptID           int64
 	AdminPendingKind         string
 	AdminPendingOffset       int
+	DraftInboundPage         int
 	Admin                    string
 	AdminID                  int64
 	PanelURL                 string
@@ -168,26 +169,29 @@ type conversation struct {
 	Updated                  time.Time
 }
 type adminPlan struct {
-	ID                 int64   `json:"id,omitempty"`
-	Name               string  `json:"name"`
-	Kind               string  `json:"kind"`
-	Enabled            bool    `json:"enabled"`
-	IsLimited          bool    `json:"is_limited"`
-	Description        string  `json:"description"`
-	BasePrice          int64   `json:"base_price_toman"`
-	PricePerExtraIP    int64   `json:"price_per_extra_ip_toman"`
-	PricePerGB         int64   `json:"price_per_gb_toman"`
-	PricePerExtraMonth int64   `json:"price_per_extra_month_toman"`
-	BaseIP             int     `json:"base_ip_limit"`
-	MaxIP              int     `json:"max_ip_limit"`
-	MinGB              int     `json:"min_data_gb"`
-	MaxBytes           int64   `json:"max_data_bytes"`
-	ExpireSeconds      int64   `json:"expire_seconds"`
-	TestIPLimit        int     `json:"test_ip_limit"`
-	MaxPerDay          int     `json:"max_per_day"`
-	Flow               string  `json:"flow"`
-	InboundIDs         []int64 `json:"inbound_ids"`
-	UsageDescription   string  `json:"usage_description"`
+	ID                 int64          `json:"id,omitempty"`
+	Name               string         `json:"name"`
+	Kind               string         `json:"kind"`
+	Enabled            bool           `json:"enabled"`
+	IsLimited          bool           `json:"is_limited"`
+	Description        string         `json:"description"`
+	BasePrice          int64          `json:"base_price_toman"`
+	PricePerExtraIP    int64          `json:"price_per_extra_ip_toman"`
+	PricePerGB         int64          `json:"price_per_gb_toman"`
+	PricePerExtraMonth int64          `json:"price_per_extra_month_toman"`
+	BaseIP             int            `json:"base_ip_limit"`
+	MaxIP              int            `json:"max_ip_limit"`
+	MinGB              int            `json:"min_data_gb"`
+	MaxBytes           int64          `json:"max_data_bytes"`
+	ExpireSeconds      int64          `json:"expire_seconds"`
+	TestIPLimit        int            `json:"test_ip_limit"`
+	MaxPerDay          int            `json:"max_per_day"`
+	DiscountTiers      []discountTier `json:"discount_tiers"`
+	Flow               string         `json:"flow"`
+	InboundIDs         []int64        `json:"inbound_ids"`
+	UsageDescription   string         `json:"usage_description"`
+	IsGlobal           bool           `json:"is_global"`
+	AllowedTelegramIDs []int64        `json:"allowed_telegram_ids"`
 }
 type adminConfig struct {
 	DeploymentID        string            `json:"deployment_id"`
@@ -1037,16 +1041,22 @@ func (a *botApp) route(c telebot.Context, action string, args []string, st conve
 		return a.adminPlans(c, true)
 	case "config-edit-plan", "config-new-plan":
 		if action == "config-new-plan" {
-			st.Admin = "new-plan-name"
-			st = a.next(st)
-			a.setState(c.Sender().ID, st)
-			return a.prompt(c, "نام طرح جدید را ارسال کنید.", true)
+			return a.startPlanDraft(c)
 		}
 		var id int64
 		if len(args) > 0 {
 			id, _ = strconv.ParseInt(args[0], 10, 64)
 		}
 		return a.editPlanPrompt(c, id, true)
+	case "plan-inbounds":
+		if len(args) != 1 {
+			return a.adminPlans(c, true)
+		}
+		id, e := strconv.ParseInt(args[0], 10, 64)
+		if e != nil || id <= 0 {
+			return a.adminPlans(c, true)
+		}
+		return a.editPlanInbounds(c, id)
 	case "pf":
 		if len(args) != 2 {
 			return a.adminPlans(c, true)
@@ -1076,11 +1086,76 @@ func (a *botApp) route(c telebot.Context, action string, args []string, st conve
 		}
 		return a.togglePlan(c, id, field)
 	case "new-plan-kind":
-		if len(args) != 1 || st.Draft == nil || st.Draft.Name == "" || (args[0] != "paid" && args[0] != "test") {
+		if len(args) != 1 {
 			return a.adminPlans(c, true)
 		}
-		st.Draft.Kind = args[0]
-		return a.createPlan(c, st.Draft)
+		return a.choosePlanKind(c, st, args[0])
+	case "draft-back":
+		if st.Draft != nil && st.Draft.ID > 0 {
+			p := *st.Draft
+			st.Draft = nil
+			st.DraftInboundPage = 0
+			st.Admin = ""
+			st = a.next(st)
+			a.setState(c.Sender().ID, st)
+			return a.planEditor(c, p, true)
+		}
+		st.Admin = ""
+		st = a.next(st)
+		a.setState(c.Sender().ID, st)
+		return a.showPlanDraft(c, true)
+	case "draft-field":
+		if len(args) != 1 {
+			return a.showPlanDraft(c, true)
+		}
+		return a.promptDraftField(c, st, args[0])
+	case "draft-toggle-limited":
+		if st.Draft == nil || st.Draft.Kind != "paid" {
+			return a.showPlanDraft(c, true)
+		}
+		st.Draft.IsLimited = !st.Draft.IsLimited
+		return a.savePlanDraftAndShow(c, st, true)
+	case "draft-flow":
+		return a.promptDraftField(c, st, "flow")
+	case "draft-flow-set":
+		if st.Draft == nil || len(args) != 1 {
+			return a.showPlanDraft(c, true)
+		}
+		st.Draft.Flow = args[0]
+		return a.savePlanDraftAndShow(c, st, true)
+	case "draft-inbounds":
+		return a.showDraftInbounds(c, true)
+	case "draft-inbound-toggle":
+		if len(args) != 1 {
+			return a.showDraftInbounds(c, true)
+		}
+		return a.toggleDraftInbound(c, st, args[0])
+	case "draft-inbounds-page":
+		if len(args) != 1 || st.Draft == nil {
+			return a.showDraftInbounds(c, true)
+		}
+		page, e := strconv.Atoi(args[0])
+		if e != nil || page < 0 {
+			return a.showDraftInbounds(c, true)
+		}
+		st.DraftInboundPage = page
+		st = a.next(st)
+		a.setState(c.Sender().ID, st)
+		return a.showDraftInbounds(c, true)
+	case "draft-inbounds-all":
+		return a.setDraftAllInbounds(c, st, true)
+	case "draft-inbounds-clear":
+		return a.setDraftAllInbounds(c, st, false)
+	case "draft-inbounds-done":
+		if st.Draft != nil && st.Draft.ID > 0 {
+			return a.saveExistingPlanInbounds(c, st.Draft)
+		}
+		return a.savePlanDraftAndShow(c, st, true)
+	case "draft-save":
+		return a.savePlanDraft(c)
+	case "draft-cancel":
+		a.resetPlanEditorState(c)
+		return a.adminPlans(c, true)
 	case "config-payment":
 		return a.adminPayment(c, true)
 	case "config-payment-field":
@@ -2515,11 +2590,8 @@ func (a *botApp) editPlanPrompt(c telebot.Context, id int64, edit bool) error {
 }
 func (a *botApp) planEditor(c telebot.Context, p adminPlan, edit bool) error {
 	st := a.state(c.Sender().ID)
-	m := &telebot.ReplyMarkup{}
-	rows := []telebot.Row{m.Row(m.Data("نام: "+buttonValue(p.Name), "nav", st.Nonce, "pf", strconv.FormatInt(p.ID, 10), planFieldCode("name")), m.Data("نوع: "+buttonValue(p.Kind), "nav", st.Nonce, "pf", strconv.FormatInt(p.ID, 10), planFieldCode("kind"))), m.Row(m.Data(boolLabel("طرح فعال", p.Enabled), "nav", st.Nonce, "pt", strconv.FormatInt(p.ID, 10), "e"), m.Data(boolLabel("حجم محدود", p.IsLimited), "nav", st.Nonce, "pt", strconv.FormatInt(p.ID, 10), "l")), m.Row(m.Data("توضیحات", "nav", st.Nonce, "pf", strconv.FormatInt(p.ID, 10), planFieldCode("description")), m.Data("قیمت پایه تومان: "+numberLabel(p.BasePrice), "nav", st.Nonce, "pf", strconv.FormatInt(p.ID, 10), planFieldCode("base_price_toman"))), m.Row(m.Data("قیمت IP اضافه: "+numberLabel(p.PricePerExtraIP), "nav", st.Nonce, "pf", strconv.FormatInt(p.ID, 10), planFieldCode("price_per_extra_ip_toman")), m.Data("قیمت هر GB: "+numberLabel(p.PricePerGB), "nav", st.Nonce, "pf", strconv.FormatInt(p.ID, 10), planFieldCode("price_per_gb_toman"))), m.Row(m.Data("قیمت ماه اضافه: "+numberLabel(p.PricePerExtraMonth), "nav", st.Nonce, "pf", strconv.FormatInt(p.ID, 10), planFieldCode("price_per_extra_month_toman")), m.Data("IP پایه/حداکثر: "+strconv.Itoa(p.BaseIP)+"/"+strconv.Itoa(p.MaxIP), "nav", st.Nonce, "pf", strconv.FormatInt(p.ID, 10), planFieldCode("ip_limits"))), m.Row(m.Data("حداقل GB: "+strconv.Itoa(p.MinGB), "nav", st.Nonce, "pf", strconv.FormatInt(p.ID, 10), planFieldCode("min_data_gb")), m.Data("حداکثر بایت: "+numberLabel(p.MaxBytes), "nav", st.Nonce, "pf", strconv.FormatInt(p.ID, 10), planFieldCode("max_data_bytes"))), m.Row(m.Data("مدت تست ثانیه: "+numberLabel(p.ExpireSeconds), "nav", st.Nonce, "pf", strconv.FormatInt(p.ID, 10), planFieldCode("expire_seconds")), m.Data("IP تست: "+strconv.Itoa(p.TestIPLimit), "nav", st.Nonce, "pf", strconv.FormatInt(p.ID, 10), planFieldCode("test_ip_limit"))), m.Row(m.Data("جریان: "+buttonValue(p.Flow), "nav", st.Nonce, "pf", strconv.FormatInt(p.ID, 10), planFieldCode("flow"))), m.Row(m.Data("شناسه‌های ورودی پنل", "nav", st.Nonce, "pf", strconv.FormatInt(p.ID, 10), planFieldCode("inbound_ids")), m.Data("راهنمای حجم", "nav", st.Nonce, "pf", strconv.FormatInt(p.ID, 10), planFieldCode("usage_description"))), m.Row(m.Data("↩️ طرح‌ها", "nav", st.Nonce, "config-plans"))}
-	m.Inline(rows...)
-	summary := fmt.Sprintf("تنظیم طرح %s (#%d). مقدار فعلی روی هر گزینه نمایش داده شده است.", p.Name, p.ID)
-	return present(c, summary, m, edit)
+	summary := fmt.Sprintf("تنظیم طرح %s (#%d). گزینه‌ها مقدار فعلی را نشان می‌دهند.", p.Name, p.ID)
+	return present(c, summary, planEditorMarkup(st, p), edit)
 }
 func buttonValue(s string) string {
 	s = strings.TrimSpace(s)
@@ -2572,11 +2644,17 @@ func planFieldCode(field string) string {
 		return "u"
 	case "usage_description":
 		return "v"
+	case "max_per_day":
+		return "q"
+	case "discount_tiers":
+		return "r"
+	case "access":
+		return "a"
 	}
 	return ""
 }
 func planFieldFromCode(code string) (string, bool) {
-	fields := []string{"name", "kind", "description", "base_price_toman", "price_per_extra_ip_toman", "price_per_gb_toman", "price_per_extra_month_toman", "ip_limits", "min_data_gb", "max_data_bytes", "expire_seconds", "test_ip_limit", "flow", "inbound_ids", "usage_description"}
+	fields := []string{"name", "kind", "description", "base_price_toman", "price_per_extra_ip_toman", "price_per_gb_toman", "price_per_extra_month_toman", "ip_limits", "min_data_gb", "max_data_bytes", "expire_seconds", "test_ip_limit", "max_per_day", "flow", "inbound_ids", "usage_description", "discount_tiers", "access"}
 	for _, field := range fields {
 		if planFieldCode(field) == code {
 			return field, true
@@ -2613,6 +2691,10 @@ func planFieldHint(field string) string {
 		return "IP پایه و حداکثر را با ویرگول بفرستید؛ نمونه: ۱,۳."
 	case "inbound_ids":
 		return "شناسه‌های عددی inbound را با ویرگول جدا کنید. فهرست خالی یعنی بدون inbound."
+	case "discount_tiers":
+		return "تخفیف‌ها را به فرمت ماه:درصد وارد کنید، مثل 3:10,6:20؛ برای حذف - بفرستید."
+	case "access":
+		return "شناسه‌های تلگرام را با کاما بفرستید؛ - یعنی دسترسی همگانی. کاربران باید قبلاً این ربات را شروع کرده باشند."
 	case "base_price_toman", "price_per_extra_ip_toman", "price_per_gb_toman", "price_per_extra_month_toman":
 		return "مبلغ را به تومان، به‌صورت عدد صحیح نامنفی بفرستید."
 	case "max_data_bytes":
@@ -2661,6 +2743,10 @@ func planFieldValue(p adminPlan, field string) string {
 		return strings.Join(parts, ",")
 	case "usage_description":
 		return p.UsageDescription
+	case "discount_tiers":
+		return formatDiscountTiers(p.DiscountTiers)
+	case "access":
+		return planAccessLabel(p.IsGlobal, p.AllowedTelegramIDs)
 	}
 	return ""
 }
@@ -2672,6 +2758,26 @@ func (a *botApp) togglePlan(c telebot.Context, id int64, field string) error {
 	for _, p := range cfg.Plans {
 		if p.ID == id {
 			if field == "enabled" {
+				if !p.Enabled {
+					if len(p.InboundIDs) == 0 {
+						return a.editPlanInbounds(c, id)
+					}
+					inbounds, inboundErr := a.panelInbounds(c)
+					if inboundErr != nil {
+						return sendFailure(c, inboundErr)
+					}
+					active := make(map[int64]bool, len(inbounds))
+					for _, inbound := range inbounds {
+						if inbound.Enable {
+							active[int64(inbound.ID)] = true
+						}
+					}
+					for _, inboundID := range p.InboundIDs {
+						if !active[int64(inboundID)] {
+							return a.editPlanInbounds(c, id)
+						}
+					}
+				}
 				p.Enabled = !p.Enabled
 			} else if field == "is_limited" {
 				p.IsLimited = !p.IsLimited
@@ -2731,6 +2837,7 @@ func (a *botApp) resetPlanEditorState(c telebot.Context) {
 	st.Admin = ""
 	st.AdminID = 0
 	st.Draft = nil
+	st.DraftInboundPage = 0
 	a.setState(c.Sender().ID, st)
 }
 func (a *botApp) adminPayment(c telebot.Context, edit bool) error {
@@ -2842,16 +2949,19 @@ func (a *botApp) adminTextInput(c telebot.Context, st conversation, value string
 	var out adminConfig
 	switch {
 	case st.Admin == "new-plan-name":
-		if len([]rune(value)) > 80 {
-			return c.Send("نام طرح حداکثر ۸۰ نویسه باشد.")
+		if strings.TrimSpace(value) == "" || len([]byte(value)) > 120 {
+			return c.Send("نام طرح باید بین ۱ تا ۱۲۰ بایت باشد.")
 		}
-		st.Draft = &adminPlan{Name: value, Enabled: false, BaseIP: 1, MaxIP: 1, InboundIDs: []int64{}}
+		st.Draft = defaultPlanDraft(value, "")
+		st.Admin = ""
 		st = a.next(st)
 		a.setState(c.Sender().ID, st)
 		st = a.state(c.Sender().ID)
 		m := &telebot.ReplyMarkup{}
 		m.Inline(m.Row(m.Data("طرح پولی", "nav", st.Nonce, "new-plan-kind", "paid"), m.Data("طرح تست", "nav", st.Nonce, "new-plan-kind", "test")), m.Row(m.Data("لغو", "nav", st.Nonce, "config-plans")))
-		return c.Send("نوع طرح جدید را انتخاب کنید. طرح ابتدا غیرفعال ساخته می‌شود.", m)
+		return c.Send("نوع طرح جدید را انتخاب کنید. طرح پس از تکمیل این پیش‌نویس ذخیره می‌شود.", m)
+	case strings.HasPrefix(st.Admin, "draft:"):
+		return a.saveDraftText(c, st, value)
 	case st.Admin == "trial-days":
 		days, e := strconv.Atoi(value)
 		if e != nil || days > 3650 {
@@ -2909,8 +3019,8 @@ func (a *botApp) adminTextInput(c telebot.Context, st conversation, value string
 		}
 		switch field {
 		case "name":
-			if len([]rune(value)) > 80 {
-				return c.Send("نام حداکثر ۸۰ نویسه باشد.")
+			if strings.TrimSpace(value) == "" || len([]byte(value)) > 120 {
+				return c.Send("نام باید بین ۱ تا ۱۲۰ بایت باشد.")
 			}
 			p.Name = value
 		case "kind":
@@ -2969,6 +3079,19 @@ func (a *botApp) adminTextInput(c telebot.Context, st conversation, value string
 			p.BaseIP, p.MaxIP = base, max
 		case "flow":
 			p.Flow = value
+		case "discount_tiers":
+			tiers, e := parseDiscountTierText(value)
+			if e != nil {
+				return c.Send("فرمت تخفیف‌ها نامعتبر است: " + e.Error())
+			}
+			p.DiscountTiers = tiers
+		case "access":
+			ids, e := parseTelegramIDList(value)
+			if e != nil {
+				return c.Send("شناسه‌های مجاز نامعتبر است: " + e.Error())
+			}
+			p.AllowedTelegramIDs = ids
+			p.IsGlobal = len(ids) == 0
 		case "inbound_ids":
 			if value == "-" {
 				p.InboundIDs = []int64{}

@@ -94,6 +94,16 @@ func TestPartialAddResponseIsUnknownAndUsesDocumentedEndpoint(t *testing.T) {
 	}
 }
 
+func TestCustomerClientCommentKeepsLegacyDeviceMarker(t *testing.T) {
+	comment := CustomerClientComment(" Gold\nPlan ", 12345, 4)
+	if comment != "created by xui-backend, devices: 4, plan: Gold Plan, telegram_id: 12345" {
+		t.Fatalf("unexpected customer comment: %q", comment)
+	}
+	if comment = CustomerClientComment("", 12345, -1); comment != "created by xui-backend, devices: 0, plan: VPN service, telegram_id: 12345" {
+		t.Fatalf("empty name or negative device limit was not normalized: %q", comment)
+	}
+}
+
 func TestGetClientAndLinksUseContractPaths(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
@@ -136,7 +146,7 @@ func TestRestoreCollisionReadbackRequiresTypedFullClientAndInboundLists(t *testi
 		case "/panel/api/inbounds/list":
 			_ = json.NewEncoder(w).Encode(map[string]any{"success": true, "obj": []any{map[string]any{"id": 1, "clientStats": []any{map[string]any{"email": "alice", "uuid": "u1", "subId": "s1"}}}}})
 		case "/panel/api/inbounds/options":
-			_ = json.NewEncoder(w).Encode(map[string]any{"success": true, "obj": []any{map[string]any{"id": 1}}})
+			_ = json.NewEncoder(w).Encode(map[string]any{"success": true, "obj": []any{map[string]any{"id": 1, "remark": "TLS", "tag": "vless-in", "protocol": "vless", "port": 443, "enable": true}}})
 		default:
 			http.NotFound(w, r)
 		}
@@ -157,6 +167,10 @@ func TestRestoreCollisionReadbackRequiresTypedFullClientAndInboundLists(t *testi
 	options, err := c.ListInboundOptions(context.Background())
 	if err != nil || len(options) != 1 || options[0] != 1 {
 		t.Fatalf("ListInboundOptions = %v, %v", options, err)
+	}
+	metadata, err := c.ListInbounds(context.Background())
+	if err != nil || len(metadata) != 1 || metadata[0].Remark != "TLS" || metadata[0].Tag != "vless-in" || metadata[0].Protocol != "vless" || metadata[0].Port != 443 || !metadata[0].Enable {
+		t.Fatalf("ListInbounds did not retain picker metadata: %+v, %v", metadata, err)
 	}
 	for _, path := range []string{"/panel/api/clients/list", "/panel/api/inbounds/list", "/panel/api/inbounds/options"} {
 		if !seen[path] {

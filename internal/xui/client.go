@@ -73,6 +73,18 @@ type RemoteClient struct {
 	TgID        int64           `json:"tgId"`
 	InboundIDs  []int           `json:"inboundIds"`
 }
+
+// InboundOption is the lightweight dropdown projection returned by 3x-ui.
+// Keep only fields used by the bot's plan editor; the panel owns the remaining
+// capability metadata in its public schema.
+type InboundOption struct {
+	ID       int    `json:"id"`
+	Remark   string `json:"remark"`
+	Tag      string `json:"tag"`
+	Protocol string `json:"protocol"`
+	Port     int    `json:"port"`
+	Enable   bool   `json:"enable"`
+}
 type envelope struct {
 	Success bool            `json:"success"`
 	Msg     string          `json:"msg"`
@@ -251,6 +263,40 @@ func (c *Client) ListInboundAttachments(ctx context.Context) ([]InboundAttachmen
 // ListInboundOptions returns known inbound IDs for validating archived
 // attachment references before an instance restore.
 func (c *Client) ListInboundOptions(ctx context.Context) ([]int, error) {
+	options, err := c.ListInbounds(ctx)
+	if err != nil {
+		return nil, err
+	}
+	ids := make([]int, 0, len(options))
+	for _, option := range options {
+		ids = append(ids, option.ID)
+	}
+	return ids, nil
+}
+
+// CustomerClientComment preserves the customer's configured device allowance
+// in the 3x-ui comment while keeping the panel's own IP limit disabled. The
+// "devices:" marker matches comments created by the legacy bots.
+func CustomerClientComment(planName string, telegramID int64, deviceLimit int) string {
+	planName = strings.Map(func(r rune) rune {
+		if r < 0x20 || r == 0x7f {
+			return ' '
+		}
+		return r
+	}, strings.TrimSpace(planName))
+	planName = strings.Join(strings.Fields(planName), " ")
+	if planName == "" {
+		planName = "VPN service"
+	}
+	if deviceLimit < 0 {
+		deviceLimit = 0
+	}
+	return fmt.Sprintf("created by xui-backend, devices: %d, plan: %s, telegram_id: %d", deviceLimit, planName, telegramID)
+}
+
+// ListInbounds returns the metadata needed to choose actual panel inbounds
+// while building a plan. It uses the documented lightweight picker endpoint.
+func (c *Client) ListInbounds(ctx context.Context) ([]InboundOption, error) {
 	env, err := c.request(ctx, http.MethodGet, "/panel/api/inbounds/options", nil)
 	if err != nil {
 		return nil, err
@@ -258,20 +304,16 @@ func (c *Client) ListInboundOptions(ctx context.Context) ([]int, error) {
 	if !env.Success {
 		return nil, fmt.Errorf("panel inbound options rejected: %s", bounded(env.Msg))
 	}
-	var rows []struct {
-		ID int `json:"id"`
-	}
-	if len(env.Obj) == 0 || string(env.Obj) == "null" || json.Unmarshal(env.Obj, &rows) != nil {
+	var options []InboundOption
+	if len(env.Obj) == 0 || string(env.Obj) == "null" || json.Unmarshal(env.Obj, &options) != nil {
 		return nil, errors.New("panel inbound options response is untyped")
 	}
-	ids := make([]int, 0, len(rows))
-	for _, row := range rows {
-		if row.ID <= 0 {
+	for _, option := range options {
+		if option.ID <= 0 {
 			return nil, errors.New("panel inbound options omitted inbound ID")
 		}
-		ids = append(ids, row.ID)
 	}
-	return ids, nil
+	return options, nil
 }
 
 func (c *Client) Add(ctx context.Context, config ClientConfig, inbounds []int) WriteResult {

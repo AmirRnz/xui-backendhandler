@@ -69,6 +69,7 @@ func (h *Handler) routes() {
 	h.mux.HandleFunc("GET /v1/admin/payments", h.pendingPayments)
 	h.mux.HandleFunc("GET /v1/admin/work-items", h.workItems)
 	h.mux.HandleFunc("GET /v1/admin/config", h.adminConfig)
+	h.mux.HandleFunc("GET /v1/admin/panels/inbounds", h.adminInbounds)
 	h.mux.HandleFunc("GET /v1/admin/resellers/pending", h.adminPendingResellers)
 	h.mux.HandleFunc("POST /v1/admin/resellers/{telegram_id}/approve", h.adminApproveReseller)
 	h.mux.HandleFunc("POST /v1/admin/resellers/{telegram_id}/reject", h.adminRejectReseller)

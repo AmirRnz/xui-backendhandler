@@ -121,7 +121,8 @@ func (r *Runner) processProvision(ctx context.Context, p Panel, w *store.WorkIte
 		if err = r.Store.MarkCreateAttempted(ctx, w.ID); err != nil {
 			return err
 		}
-		result := p.Add(ctx, xui.ClientConfig{ID: w.Desired.ClientUUID, Email: w.Desired.Email, SubID: w.Desired.SubID, Enable: true, ExpiryTime: w.Desired.ExpiryTimeMS, LimitIP: w.Desired.IPLimit, LimitHWID: 0, TotalGB: w.Desired.TrafficLimitBytes, Flow: w.Desired.Flow, Comment: w.Desired.PlanName, TgID: w.Desired.TelegramID}, w.Desired.InboundIDs)
+		comment := xui.CustomerClientComment(w.Desired.PlanName, w.Desired.TelegramID, w.Desired.IPLimit)
+		result := p.Add(ctx, xui.ClientConfig{ID: w.Desired.ClientUUID, Email: w.Desired.Email, SubID: w.Desired.SubID, Enable: true, ExpiryTime: w.Desired.ExpiryTimeMS, LimitIP: 0, LimitHWID: 0, TotalGB: w.Desired.TrafficLimitBytes, Flow: w.Desired.Flow, Comment: comment, TgID: w.Desired.TelegramID}, w.Desired.InboundIDs)
 		if result.Outcome == xui.DefinitiveNoWrite {
 			reason := "panel confirmed no write"
 			if result.Err != nil {
@@ -152,7 +153,7 @@ func (r *Runner) processProvision(ctx context.Context, p Panel, w *store.WorkIte
 }
 
 func (r *Runner) verifyProvision(ctx context.Context, p Panel, w *store.WorkItem, remote *xui.RemoteClient) error {
-	if !sameCore(w, remote) || remote.Enable != true || remote.ExpiryTime != w.Desired.ExpiryTimeMS || remote.LimitIP != w.Desired.IPLimit || remote.TrafficLimit() != w.Desired.TrafficLimitBytes {
+	if !matchesProvisionFields(w, remote) {
 		return r.Store.ManualReviewWork(ctx, w.ID, "panel client does not match the persisted identity and desired state", map[string]any{"email": remoteEmail(remote), "uuid": xui.UUIDOf(remote), "sub_id": remoteSub(remote), "inbounds": remoteInbounds(remote)})
 	}
 	desired := unique(w.Desired.InboundIDs)
@@ -190,6 +191,20 @@ func (r *Runner) verifyProvision(ctx context.Context, p Panel, w *store.WorkItem
 		links = []string{}
 	}
 	return r.Store.SucceedWork(ctx, w, links)
+}
+
+func matchesProvisionFields(w *store.WorkItem, remote *xui.RemoteClient) bool {
+	if w == nil || remote == nil || !sameCore(w, remote) || !remote.Enable || remote.ExpiryTime != w.Desired.ExpiryTimeMS || remote.TrafficLimit() != w.Desired.TrafficLimitBytes {
+		return false
+	}
+	modernComment := xui.CustomerClientComment(w.Desired.PlanName, w.Desired.TelegramID, w.Desired.IPLimit)
+	if remote.LimitIP == 0 && remote.Comment == modernComment {
+		return true
+	}
+	// Work created before comment-based device limits were introduced can still
+	// finish safely when its original panel state matches the old desired values.
+	// This keeps an already-attempted provision out of manual review during rollout.
+	return remote.LimitIP == w.Desired.IPLimit && remote.Comment == w.Desired.PlanName
 }
 
 func sameCore(w *store.WorkItem, remote *xui.RemoteClient) bool {
