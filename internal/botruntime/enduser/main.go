@@ -64,6 +64,11 @@ type quote struct {
 	DiscountToman        int64  `json:"discount_toman"`
 	Price                int64  `json:"final_price_toman"`
 	Currency             string `json:"currency"`
+	Action               string `json:"action"`
+	SubscriptionID       int64  `json:"subscription_id"`
+	CurrentIPLimit       int    `json:"current_ip_limit"`
+	CurrentExpiryTimeMS  int64  `json:"current_expiry_time_ms"`
+	DesiredExpiryTimeMS  int64  `json:"desired_expiry_time_ms"`
 }
 type purchase struct {
 	OrderID        int64  `json:"order_id"`
@@ -76,6 +81,7 @@ type subscriptionView struct {
 	ID                int64    `json:"id"`
 	Email             string   `json:"email"`
 	DisplayName       string   `json:"display_name"`
+	PlanID            int64    `json:"plan_id"`
 	Status            string   `json:"status"`
 	Kind              string   `json:"kind"`
 	IPLimit           int      `json:"ip_limit"`
@@ -141,6 +147,8 @@ type conversation struct {
 	Nonce                    string
 	Step                     string
 	PlanID                   int64
+	SubscriptionID           int64
+	MutationAction           string
 	Method                   string
 	Months                   int
 	IPLimit                  int
@@ -663,6 +671,11 @@ func (a *botApp) callbackFailure(c telebot.Context, action string, st conversati
 		m.Inline(m.Row(m.Data("🔁 همان پرداخت را دوباره بررسی کنید", "nav", st.Nonce, "retry-purchase")), m.Row(m.Data("🏠 خانه", "nav", st.Nonce, "home")))
 		return present(c, "پرداخت تأیید نشد. اگر پاسخ backend نامشخص مانده باشد، تلاش دوباره با همان شناسه فقط یک سفارش ثبت می‌کند.", m, true)
 	}
+	if action == "mutation-pay" && st.QuoteID > 0 {
+		st = a.next(st)
+		a.setState(c.Sender().ID, st)
+		return a.mutationConfirmation(c, st, "پرداخت ثبت نشد. همان درخواست را دوباره بررسی کنید یا روش پرداخت را عوض کنید.", true)
+	}
 	return a.freshHome(c, "درخواست انجام نشد. از منوی تازه دوباره تلاش کنید.")
 }
 func (a *botApp) getFeatures(c telebot.Context) (publicFeatures, error) {
@@ -925,6 +938,69 @@ func (a *botApp) route(c telebot.Context, action string, args []string, st conve
 			return a.services(c, true)
 		}
 		return a.serviceDetail(c, id, true)
+	case "service-extend":
+		if len(args) != 1 {
+			return a.services(c, true)
+		}
+		id, e := strconv.ParseInt(args[0], 10, 64)
+		if e != nil || id <= 0 {
+			return a.services(c, true)
+		}
+		return a.subscriptionExtensionMenu(c, id, true)
+	case "service-extend-custom":
+		if len(args) != 1 {
+			return a.services(c, true)
+		}
+		id, e := strconv.ParseInt(args[0], 10, 64)
+		if e != nil || id <= 0 {
+			return a.services(c, true)
+		}
+		st.SubscriptionID = id
+		st.Step = "service-renew-months"
+		st = a.next(st)
+		a.setState(c.Sender().ID, st)
+		return a.prompt(c, "مدت تمدید را به ماه وارد کنید (۱ تا ۱۲۰).", true)
+	case "service-extend-quote":
+		if len(args) != 2 {
+			return a.services(c, true)
+		}
+		id, e1 := strconv.ParseInt(args[0], 10, 64)
+		months, e2 := strconv.Atoi(args[1])
+		if e1 != nil || e2 != nil || id <= 0 || months < 1 || months > 120 {
+			return a.services(c, true)
+		}
+		key := callbackOperationKey(c, "subscription-extend-quote", fmt.Sprintf("%d:%d", id, months))
+		return a.createSubscriptionMutationQuote(c, st, id, "extend", months, 0, key, true)
+	case "service-upgrade-menu":
+		if len(args) != 1 {
+			return a.services(c, true)
+		}
+		id, e := strconv.ParseInt(args[0], 10, 64)
+		if e != nil || id <= 0 {
+			return a.services(c, true)
+		}
+		return a.subscriptionDeviceUpgradeMenu(c, id, true)
+	case "service-upgrade-quote":
+		if len(args) != 2 {
+			return a.services(c, true)
+		}
+		id, e1 := strconv.ParseInt(args[0], 10, 64)
+		ipLimit, e2 := strconv.Atoi(args[1])
+		if e1 != nil || e2 != nil || id <= 0 || ipLimit <= 0 {
+			return a.services(c, true)
+		}
+		key := callbackOperationKey(c, "subscription-upgrade-quote", fmt.Sprintf("%d:%d", id, ipLimit))
+		return a.createSubscriptionMutationQuote(c, st, id, "upgrade_ip", 0, ipLimit, key, true)
+	case "mutation-pay":
+		if len(args) != 1 || st.QuoteID <= 0 || st.SubscriptionID <= 0 || (args[0] != "wallet" && args[0] != "direct") {
+			return a.services(c, true)
+		}
+		return a.submitSubscriptionMutation(c, st, args[0])
+	case "mutation-cancel":
+		if st.SubscriptionID <= 0 {
+			return a.services(c, true)
+		}
+		return a.serviceDetail(c, st.SubscriptionID, true)
 	case "cancel":
 		if len(args) != 1 {
 			return a.home(c, "درخواست نامعتبر است.", true)
@@ -1549,6 +1625,13 @@ func (a *botApp) text(c telebot.Context) error {
 		}
 		st.Months = n
 		return a.afterPurchaseDuration(c, st, false)
+	case "service-renew-months":
+		months, e := strconv.Atoi(value)
+		if e != nil || months < 1 || months > 120 || st.SubscriptionID <= 0 {
+			return c.Send("مدت تمدید باید عددی بین ۱ تا ۱۲۰ ماه باشد.")
+		}
+		key := stableKey(c.Sender().ID, c.Chat().ID, int64(c.Message().ID), fmt.Sprintf("subscription-extend:%d:%d", st.SubscriptionID, months))
+		return a.createSubscriptionMutationQuote(c, st, st.SubscriptionID, "extend", months, 0, key, false)
 	case "purchase-ip":
 		n, e := strconv.Atoi(value)
 		if e != nil || n < 0 || n > 100 {
@@ -1956,6 +2039,12 @@ func (a *botApp) serviceDetail(c telebot.Context, id int64, edit bool) error {
 			text += fmt.Sprintf("\n\n🔗 لینک اتصال %d:\n%s", i+1, link)
 		}
 	}
+	if sub.Kind == "paid" && (sub.Status == "active" || sub.Status == "expired") {
+		rows = append(rows, m.Row(m.Data("⏳ تمدید سرویس", "nav", st.Nonce, "service-extend", strconv.FormatInt(sub.ID, 10))))
+	}
+	if sub.Kind == "paid" && sub.Status == "active" {
+		rows = append(rows, m.Row(m.Data("📱 ارتقای تعداد دستگاه", "nav", st.Nonce, "service-upgrade-menu", strconv.FormatInt(sub.ID, 10))))
+	}
 	rows = append(rows, m.Row(m.Data("🗑 درخواست لغو سرویس", "nav", st.Nonce, "cancel", strconv.FormatInt(sub.ID, 10))))
 	if sub.Kind == "paid" {
 		rows = append(rows, m.Row(m.Data("💸 درخواست بازپرداخت", "nav", st.Nonce, "refund-request", strconv.FormatInt(sub.ID, 10))))
@@ -1963,6 +2052,216 @@ func (a *botApp) serviceDetail(c telebot.Context, id int64, edit bool) error {
 	rows = append(rows, m.Row(m.Data("« بازگشت", "nav", st.Nonce, "services")))
 	m.Inline(rows...)
 	return present(c, text, m, edit)
+}
+
+func (a *botApp) loadOwnedSubscription(c telebot.Context, id int64) (*subscriptionView, error) {
+	act, err := a.resolve(c)
+	if err != nil {
+		return nil, err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	var items []subscriptionView
+	if err = a.api.Call(ctx, "GET", "/v1/subscriptions", act.TelegramID, nil, &items); err != nil {
+		return nil, err
+	}
+	for i := range items {
+		if items[i].ID == id {
+			return &items[i], nil
+		}
+	}
+	return nil, errors.New("subscription not found")
+}
+
+func (a *botApp) subscriptionExtensionMenu(c telebot.Context, id int64, edit bool) error {
+	sub, err := a.loadOwnedSubscription(c, id)
+	if err != nil || sub.Kind != "paid" || (sub.Status != "active" && sub.Status != "expired") || sub.ExpiryTimeMS == 0 {
+		return a.serviceDetail(c, id, edit)
+	}
+	name := sub.DisplayName
+	if name == "" {
+		name = sub.Email
+	}
+	st := a.state(c.Sender().ID)
+	m := &telebot.ReplyMarkup{}
+	m.Inline(
+		m.Row(m.Data("۱ ماه", "nav", st.Nonce, "service-extend-quote", strconv.FormatInt(id, 10), "1"), m.Data("۳ ماه", "nav", st.Nonce, "service-extend-quote", strconv.FormatInt(id, 10), "3")),
+		m.Row(m.Data("۶ ماه", "nav", st.Nonce, "service-extend-quote", strconv.FormatInt(id, 10), "6"), m.Data("✏️ مدت دلخواه", "nav", st.Nonce, "service-extend-custom", strconv.FormatInt(id, 10))),
+		m.Row(m.Data("« بازگشت", "nav", st.Nonce, "services-view", strconv.FormatInt(id, 10))),
+	)
+	return present(c, fmt.Sprintf("⏳ تمدید سرویس %s\nمدت تمدید را انتخاب کنید. مبلغ دقیق پیش از پرداخت نمایش داده می‌شود.", name), m, edit)
+}
+
+func (a *botApp) subscriptionDeviceUpgradeMenu(c telebot.Context, id int64, edit bool) error {
+	sub, err := a.loadOwnedSubscription(c, id)
+	if err != nil || sub.Kind != "paid" || sub.Status != "active" || sub.PlanID <= 0 {
+		return a.serviceDetail(c, id, edit)
+	}
+	act, err := a.resolve(c)
+	if err != nil {
+		return sendFailure(c, err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	var plans []plan
+	if err = a.api.Call(ctx, "GET", "/v1/plans?kind=paid", act.TelegramID, nil, &plans); err != nil {
+		return sendFailure(c, err)
+	}
+	var selected *plan
+	for i := range plans {
+		if plans[i].ID == sub.PlanID {
+			selected = &plans[i]
+			break
+		}
+	}
+	if selected == nil || selected.MaxIP <= sub.IPLimit || sub.IPLimit <= 0 {
+		return present(c, "برای این سرویس دستگاه اضافه‌ای در محدوده طرح موجود نیست.", &telebot.ReplyMarkup{}, edit)
+	}
+	st := a.state(c.Sender().ID)
+	m := &telebot.ReplyMarkup{}
+	rows := make([]telebot.Row, 0, 12)
+	end := selected.MaxIP
+	if end > sub.IPLimit+8 {
+		end = sub.IPLimit + 8
+	}
+	for devices := sub.IPLimit + 1; devices <= end; devices++ {
+		rows = append(rows, m.Row(m.Data(fmt.Sprintf("%d دستگاه", devices), "nav", st.Nonce, "service-upgrade-quote", strconv.FormatInt(id, 10), strconv.Itoa(devices))))
+	}
+	if end < selected.MaxIP {
+		rows = append(rows, m.Row(m.Data(fmt.Sprintf("حداکثر %d دستگاه", selected.MaxIP), "nav", st.Nonce, "service-upgrade-quote", strconv.FormatInt(id, 10), strconv.Itoa(selected.MaxIP))))
+	}
+	rows = append(rows, m.Row(m.Data("« بازگشت", "nav", st.Nonce, "services-view", strconv.FormatInt(id, 10))))
+	m.Inline(rows...)
+	return present(c, fmt.Sprintf("📱 ارتقای سقف دستگاه برای %s\nسقف فعلی: %d\nطرح اجازه تا %d دستگاه را می‌دهد.\nمبلغ تا زمان انقضای سرویس محاسبه می‌شود.", sub.DisplayName, sub.IPLimit, selected.MaxIP), m, edit)
+}
+
+func (a *botApp) createSubscriptionMutationQuote(c telebot.Context, st conversation, id int64, action string, months, ipLimit int, key string, edit bool) error {
+	sub, err := a.loadOwnedSubscription(c, id)
+	if err != nil || sub.Kind != "paid" {
+		return a.services(c, edit)
+	}
+	if action == "extend" {
+		ipLimit = sub.IPLimit
+	}
+	act, err := a.resolve(c)
+	if err != nil {
+		return sendFailure(c, err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	var q quote
+	body := map[string]any{"action": action, "months": months, "ip_limit": ipLimit, "idempotency_key": key}
+	path := fmt.Sprintf("/v1/subscriptions/%d/quotes", id)
+	if err = a.api.Call(ctx, "POST", path, act.TelegramID, body, &q); err != nil {
+		return sendFailure(c, err)
+	}
+	st.SubscriptionID = id
+	st.MutationAction = action
+	st.Months = months
+	st.IPLimit = ipLimit
+	st.OperationKey = key
+	st.QuoteID = q.ID
+	st.QuotePrice = q.Price
+	st.Step = "mutation-payment"
+	st = a.next(st)
+	a.setState(c.Sender().ID, st)
+	return a.mutationConfirmation(c, st, "", edit)
+}
+
+func (a *botApp) mutationConfirmation(c telebot.Context, st conversation, notice string, edit bool) error {
+	features, err := a.getFeatures(c)
+	if err != nil {
+		return sendFailure(c, err)
+	}
+	balance := "0"
+	if featureEnabled(features, "wallet_enabled") {
+		act, resolveErr := a.resolve(c)
+		if resolveErr != nil {
+			return sendFailure(c, resolveErr)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		var wallet map[string]any
+		err = a.api.Call(ctx, "GET", "/v1/wallet", act.TelegramID, nil, &wallet)
+		cancel()
+		if err != nil {
+			return sendFailure(c, err)
+		}
+		balance = formatToman(wallet["balance_toman"])
+	}
+	name := "سرویس"
+	if sub, loadErr := a.loadOwnedSubscription(c, st.SubscriptionID); loadErr == nil {
+		name = sub.DisplayName
+		if name == "" {
+			name = sub.Email
+		}
+	}
+	detail := fmt.Sprintf("سرویس: %s\nمبلغ: %s تومان", name, formatToman(st.QuotePrice))
+	if st.MutationAction == "extend" {
+		detail = fmt.Sprintf("تمدید %d ماهه سرویس %s\nمبلغ: %s تومان", st.Months, name, formatToman(st.QuotePrice))
+	} else if st.MutationAction == "upgrade_ip" {
+		detail = fmt.Sprintf("ارتقا به %d دستگاه برای سرویس %s\nمبلغ تا پایان دوره: %s تومان", st.IPLimit, name, formatToman(st.QuotePrice))
+	}
+	if notice != "" {
+		detail = notice + "\n\n" + detail
+	}
+	m := &telebot.ReplyMarkup{}
+	st = a.state(c.Sender().ID)
+	rows := make([]telebot.Row, 0, 3)
+	if featureEnabled(features, "wallet_enabled") {
+		rows = append(rows, m.Row(m.Data("👛 پرداخت از کیف پول", "nav", st.Nonce, "mutation-pay", "wallet")))
+		detail += fmt.Sprintf("\nموجودی کیف پول: %s تومان", balance)
+	}
+	if featureEnabled(features, "direct_payments_enabled") {
+		rows = append(rows, m.Row(m.Data("💳 پرداخت مستقیم", "nav", st.Nonce, "mutation-pay", "direct")))
+	}
+	rows = append(rows, m.Row(m.Data("❌ انصراف", "nav", st.Nonce, "mutation-cancel")))
+	m.Inline(rows...)
+	return present(c, detail, m, edit)
+}
+
+func (a *botApp) submitSubscriptionMutation(c telebot.Context, st conversation, method string) error {
+	act, err := a.resolve(c)
+	if err != nil {
+		return sendFailure(c, err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	var instructions map[string]any
+	if method == "direct" {
+		if err = a.api.Call(ctx, "GET", "/v1/payment-instructions", act.TelegramID, nil, &instructions); err != nil {
+			return sendFailure(c, err)
+		}
+		if !hasPaymentDestination(instructions) {
+			return a.mutationConfirmation(c, st, "اطلاعات پرداخت مستقیم هنوز توسط مدیریت تنظیم نشده است.", true)
+		}
+	}
+	var out purchase
+	body := map[string]any{"quote_id": st.QuoteID, "payment_method": method, "idempotency_key": st.OperationKey + ":" + method}
+	path := fmt.Sprintf("/v1/subscriptions/%d/mutations", st.SubscriptionID)
+	if err = a.api.Call(ctx, "POST", path, act.TelegramID, body, &out); err != nil {
+		return sendFailure(c, err)
+	}
+	if method == "wallet" {
+		return a.home(c, fmt.Sprintf("درخواست %s با هزینه %s تومان ثبت شد و پس از همگام‌سازی با پنل اعمال می‌شود.", mutationActionName(st.MutationAction), formatToman(out.Amount)), true)
+	}
+	st.Receipt = &receiptState{Kind: "payment", ID: out.IntentID}
+	st.Step = "receipt-photo"
+	st = a.next(st)
+	a.setState(c.Sender().ID, st)
+	m := &telebot.ReplyMarkup{}
+	m.Inline(m.Row(m.Data("📷 ارسال عکس رسید", "nav", st.Nonce, "receipt-payment", strconv.FormatInt(out.IntentID, 10))), m.Row(m.Data("🏠 خانه", "nav", st.Nonce, "home")))
+	return c.Send(fmt.Sprintf("درخواست %s شماره %d\nمبلغ: %s تومان\n\n%s\n\nپس از پرداخت، عکس رسید را ارسال کنید تا پس از بررسی اعمال شود.", mutationActionName(st.MutationAction), out.IntentID, formatToman(out.Amount), formatPaymentInstructions(instructions)), m)
+}
+
+func mutationActionName(action string) string {
+	switch action {
+	case "extend":
+		return "تمدید سرویس"
+	case "upgrade_ip":
+		return "ارتقای تعداد دستگاه"
+	default:
+		return "تغییر سرویس"
+	}
 }
 
 func truncateButton(value string) string {

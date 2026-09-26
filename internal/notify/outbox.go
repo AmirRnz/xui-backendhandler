@@ -138,6 +138,15 @@ func formatMessage(topic string, payload any) string {
 		return out
 	case "subscription.cancelled":
 		return fmt.Sprintf("اشتراک %s لغو شد.", name)
+	case "subscription.updated":
+		switch m["action"] {
+		case "extend":
+			return fmt.Sprintf("تمدید اشتراک %s با پنل همگام شد.", name)
+		case "upgrade_ip":
+			return fmt.Sprintf("سقف دستگاه‌های اشتراک %s به %v تغییر کرد.", name, m["ip_limit"])
+		default:
+			return fmt.Sprintf("تغییرات اشتراک %s با پنل همگام شد.", name)
+		}
 	case "refund.approved":
 		return fmt.Sprintf("بازپرداخت به کیف پول شما اضافه شد: %v تومان.", m["amount_toman"])
 	case "payment.rejected":
