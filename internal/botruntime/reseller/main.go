@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"math"
 	"os"
 	"os/signal"
 	"strconv"
@@ -32,27 +33,29 @@ type actor struct {
 	ApprovalStatus string `json:"approval_status"`
 }
 type plan struct {
-	ID               int64          `json:"id"`
-	Name             string         `json:"name"`
-	Kind             string         `json:"kind"`
-	Enabled          bool           `json:"enabled"`
-	IsLimited        bool           `json:"is_limited"`
-	Description      string         `json:"description"`
-	BasePrice        int64          `json:"base_price_toman"`
-	PriceExtraIP     int64          `json:"price_per_extra_ip_toman"`
-	PriceGB          int64          `json:"price_per_gb_toman"`
-	PriceExtraMonth  int64          `json:"price_per_extra_month_toman"`
-	BaseIP           int            `json:"base_ip_limit"`
-	MaxIP            int            `json:"max_ip_limit"`
-	MinGB            int            `json:"min_data_gb"`
-	MaxBytes         int64          `json:"max_data_bytes"`
-	ExpireSeconds    int64          `json:"expire_seconds"`
-	TestIPLimit      int            `json:"test_ip_limit"`
-	MaxPerDay        int            `json:"max_per_day"`
-	Flow             string         `json:"flow"`
-	InboundIDs       []int          `json:"inbound_ids"`
-	UsageDescription string         `json:"usage_description"`
-	DiscountTiers    []discountTier `json:"discount_tiers"`
+	ID                 int64          `json:"id"`
+	Name               string         `json:"name"`
+	Kind               string         `json:"kind"`
+	Enabled            bool           `json:"enabled"`
+	IsLimited          bool           `json:"is_limited"`
+	Description        string         `json:"description"`
+	BasePrice          int64          `json:"base_price_toman"`
+	PriceExtraIP       int64          `json:"price_per_extra_ip_toman"`
+	PriceGB            int64          `json:"price_per_gb_toman"`
+	PriceExtraMonth    int64          `json:"price_per_extra_month_toman"`
+	BaseIP             int            `json:"base_ip_limit"`
+	MaxIP              int            `json:"max_ip_limit"`
+	MinGB              int            `json:"min_data_gb"`
+	MaxBytes           int64          `json:"max_data_bytes"`
+	ExpireSeconds      int64          `json:"expire_seconds"`
+	TestIPLimit        int            `json:"test_ip_limit"`
+	MaxPerDay          int            `json:"max_per_day"`
+	Flow               string         `json:"flow"`
+	InboundIDs         []int          `json:"inbound_ids"`
+	UsageDescription   string         `json:"usage_description"`
+	DiscountTiers      []discountTier `json:"discount_tiers"`
+	IsGlobal           bool           `json:"is_global"`
+	AllowedTelegramIDs []int64        `json:"allowed_telegram_ids"`
 }
 type discountTier struct {
 	Months      int   `json:"months"`
@@ -108,11 +111,13 @@ type subscription struct {
 	Links             []string `json:"links"`
 }
 type conversation struct {
-	Step    string
-	Vals    map[string]string
-	PlanID  int64
-	Method  string
-	Expires time.Time
+	Step             string
+	Vals             map[string]string
+	PlanID           int64
+	PlanDraft        *plan
+	DraftInboundPage int
+	Method           string
+	Expires          time.Time
 }
 type botApp struct {
 	api      *backend.Client
@@ -900,6 +905,21 @@ func (a *botApp) callback(c telebot.Context) error {
 			return a.homeFor(c, "این بخش در دسترس نیست.")
 		}
 		return a.startPlanEdit(c, act, data[1], data[2])
+	case "plannewkind":
+		if !isAdmin(act) || len(data) != 2 || !isPrivateChat(c.Chat()) {
+			return a.homeFor(c, "این بخش فقط برای مدیر و در گفت‌وگوی خصوصی در دسترس است.")
+		}
+		return a.choosePlanDraftKind(c, act, data[1])
+	case "plandraft":
+		if !isAdmin(act) || len(data) < 2 || !isPrivateChat(c.Chat()) {
+			return a.homeFor(c, "این بخش فقط برای مدیر و در گفت‌وگوی خصوصی در دسترس است.")
+		}
+		return a.handlePlanDraftAction(c, act, data[1:])
+	case "planinbound":
+		if !isAdmin(act) || len(data) < 2 || !isPrivateChat(c.Chat()) {
+			return a.homeFor(c, "این بخش فقط برای مدیر و در گفت‌وگوی خصوصی در دسترس است.")
+		}
+		return a.handlePlanInboundAction(c, act, data[1:])
 	case "feature":
 		if !isAdmin(act) || len(data) < 2 {
 			return a.homeFor(c, "این بخش در دسترس نیست.")
@@ -1130,11 +1150,24 @@ func (a *botApp) text(c telebot.Context) error {
 			return a.home(c, act, "این بخش در دسترس نیست.")
 		}
 		return a.savePlanValue(c, act, st, raw)
-	case "plancreate":
-		if !isAdmin(act) {
-			return a.home(c, act, "این بخش در دسترس نیست.")
+	case "plan-draft-name":
+		if !isAdmin(act) || !isPrivateChat(c.Chat()) || st.PlanDraft == nil {
+			return a.home(c, act, "پیش‌نویس طرح پیدا نشد. از منوی مدیریت دوباره شروع کنید.")
 		}
-		return a.collectNewPlan(c, act, st, raw)
+		name := strings.TrimSpace(raw)
+		if name == "" || len([]byte(name)) > 120 {
+			return a.setFlowAndPrompt(c, act.TelegramID, st, "نام طرح باید بین ۱ تا ۱۲۰ بایت باشد. نام را دوباره بفرستید.")
+		}
+		st.PlanDraft.Name = name
+		st.Step = ""
+		st.Expires = time.Now().Add(20 * time.Minute)
+		a.setFlow(act.TelegramID, st)
+		return a.showPlanDraftKind(c, act, st.PlanDraft)
+	case "plan-draft-field":
+		if !isAdmin(act) || !isPrivateChat(c.Chat()) || st.PlanDraft == nil {
+			return a.home(c, act, "پیش‌نویس طرح پیدا نشد. از منوی مدیریت دوباره شروع کنید.")
+		}
+		return a.savePlanDraftField(c, act, st, raw)
 	default:
 		a.clearFlow(act.TelegramID)
 		return a.home(c, act, "ورودی منقضی شد. از منو دوباره شروع کنید.")
@@ -1147,7 +1180,7 @@ func isPrivateChat(chat *telebot.Chat) bool {
 
 func adminFlowStep(step string) bool {
 	switch step {
-	case "cfgvalue", "cfgtextkey", "planvalue", "plancreate", "paneltoken":
+	case "cfgvalue", "cfgtextkey", "planvalue", "paneltoken", "plan-draft-name", "plan-draft-field":
 		return true
 	default:
 		return false
@@ -1535,12 +1568,16 @@ func (a *botApp) configPlans(c telebot.Context, act actor) error {
 	}
 	rows := make([][]telebot.Btn, 0, len(cfg.Plans)+2)
 	for _, p := range cfg.Plans {
-		rows = append(rows, []telebot.Btn{btn(fmt.Sprintf("%s · %s · %t", p.Name, p.Kind, p.Enabled), fmt.Sprintf("planedit|%d", p.ID))})
+		rows = append(rows, []telebot.Btn{btn(planPickerLabel(p), fmt.Sprintf("planedit|%d", p.ID))})
 	}
 	rows = append(rows, []telebot.Btn{btn("ایجاد طرح", "cfgset|plan|new")}, []telebot.Btn{btn("بازگشت", "config")})
 	return a.show(c, "طرح را برای ویرایش قیمت‌ها و مشخصات انتخاب کنید.", markup(rows...))
 }
 func (a *botApp) planEditor(c telebot.Context, act actor, idText string) error {
+	return a.planEditorWithNotice(c, act, idText, "")
+}
+
+func (a *botApp) planEditorWithNotice(c telebot.Context, act actor, idText, notice string) error {
 	id, e := strconv.ParseInt(idText, 10, 64)
 	if e != nil {
 		return a.show(c, "شناسه طرح نامعتبر است.")
@@ -1551,27 +1588,118 @@ func (a *botApp) planEditor(c telebot.Context, act actor, idText string) error {
 	}
 	for _, p := range cfg.Plans {
 		if p.ID == id {
-			return a.show(c, fmt.Sprintf("طرح %s · نوع %s · فعال %t · قیمت پایه %d · هر GB %d · سهمیه روزانه %d", p.Name, p.Kind, p.Enabled, p.BasePrice, p.PriceGB, p.MaxPerDay), markup([]telebot.Btn{btn("نام", "planfield|"+idText+"|name"), btn("نوع paid/test", "planfield|"+idText+"|kind")}, []telebot.Btn{btn("فعال", "planfield|"+idText+"|enabled"), btn("محدودیت حجمی", "planfield|"+idText+"|is_limited")}, []telebot.Btn{btn("توضیحات", "planfield|"+idText+"|description"), btn("قیمت پایه", "planfield|"+idText+"|base_price_toman")}, []telebot.Btn{btn("قیمت هر GB", "planfield|"+idText+"|price_per_gb_toman"), btn("قیمت IP اضافه", "planfield|"+idText+"|price_per_extra_ip_toman")}, []telebot.Btn{btn("قیمت ماه اضافه", "planfield|"+idText+"|price_per_extra_month_toman"), btn("سهمیه روزانه", "planfield|"+idText+"|max_per_day")}, []telebot.Btn{btn("IP پایه", "planfield|"+idText+"|base_ip_limit"), btn("حداکثر IP", "planfield|"+idText+"|max_ip_limit")}, []telebot.Btn{btn("حداقل GB", "planfield|"+idText+"|min_data_gb"), btn("حداکثر bytes", "planfield|"+idText+"|max_data_bytes")}, []telebot.Btn{btn("مدت تست", "planfield|"+idText+"|expire_seconds"), btn("IP تست", "planfield|"+idText+"|test_ip_limit")}, []telebot.Btn{btn("Flow", "planfield|"+idText+"|flow"), btn("Inbound IDs", "planfield|"+idText+"|inbound_ids")}, []telebot.Btn{btn("توضیح مصرف", "planfield|"+idText+"|usage_description")}, []telebot.Btn{btn("بازگشت", "cfg|plans")}))
+			message := formatAdminPlan(p)
+			if notice != "" {
+				message = notice + "\n\n" + message
+			}
+			return a.show(c, message, planEditorMarkup(p))
 		}
 	}
 	return a.show(c, "طرح پیدا نشد.", markup([]telebot.Btn{btn("بازگشت", "cfg|plans")}))
 }
 func (a *botApp) startPlanEdit(c telebot.Context, act actor, id, field string) error {
-	current := ""
 	var cfg adminConfig
-	if err := a.call(c, "GET", "/v1/admin/config", act.TelegramID, nil, &cfg); err == nil {
-		for _, p := range cfg.Plans {
-			if strconv.FormatInt(p.ID, 10) == id {
-				b, _ := json.Marshal(p)
-				values := map[string]json.RawMessage{}
-				_ = json.Unmarshal(b, &values)
-				current = string(values[field])
-				break
-			}
+	if err := a.call(c, "GET", "/v1/admin/config", act.TelegramID, nil, &cfg); err != nil {
+		return a.sendFailure(c, err)
+	}
+	var selected *plan
+	for i := range cfg.Plans {
+		if strconv.FormatInt(cfg.Plans[i].ID, 10) == id {
+			selected = &cfg.Plans[i]
+			break
 		}
 	}
+	if selected == nil {
+		return a.show(c, "طرح پیدا نشد.", markup([]telebot.Btn{btn("بازگشت", "cfg|plans")}))
+	}
+	if field == "inbound_ids" {
+		return a.startExistingPlanInboundEdit(c, act, *selected)
+	}
+	current := planSummaryText(planFieldValue(*selected, field), 1000)
 	a.setFlow(act.TelegramID, conversation{Step: "planvalue", Vals: map[string]string{"id": id, "field": field}, Expires: time.Now().Add(20 * time.Minute)})
-	return a.show(c, fmt.Sprintf("مقدار فعلی %s: %s\nمقدار جدید را وارد کنید.", field, current), markup([]telebot.Btn{btn("لغو", "config")}))
+	return a.show(c, fmt.Sprintf("%s\nمقدار فعلی: %s", planFieldPrompt(field), current), markup([]telebot.Btn{btn("لغو", "cfg|plans")}))
+}
+
+func planFieldPrompt(field string) string {
+	prompts := map[string]string{
+		"name":                        "نام طرح را وارد کنید.",
+		"kind":                        "نوع طرح را وارد کنید: paid یا test.",
+		"enabled":                     "وضعیت فعال را وارد کنید: true یا false.",
+		"is_limited":                  "نوع محدودیت را وارد کنید: true یا false.",
+		"description":                 "توضیحات طرح را وارد کنید؛ برای پاک‌کردن - بفرستید.",
+		"base_price_toman":            "قیمت پایه را به تومان و به‌صورت عدد صحیح نامنفی وارد کنید.",
+		"price_per_extra_ip_toman":    "قیمت هر IP اضافه را به تومان وارد کنید.",
+		"price_per_gb_toman":          "قیمت هر GB را به تومان وارد کنید.",
+		"price_per_extra_month_toman": "قیمت هر ماه اضافه را به تومان وارد کنید.",
+		"base_ip_limit":               "تعداد IP پایه را وارد کنید؛ صفر یعنی نامحدود.",
+		"max_ip_limit":                "حداکثر تعداد IP را وارد کنید؛ صفر یعنی نامحدود.",
+		"min_data_gb":                 "حداقل حجم را به GB وارد کنید.",
+		"max_data_gb":                 "حداکثر حجم را به GB وارد کنید؛ اعشار مجاز است و صفر یعنی نامحدود.",
+		"expire_seconds":              "مدت را به ثانیه وارد کنید.",
+		"test_ip_limit":               "تعداد IP نمایشی تست را وارد کنید.",
+		"max_per_day":                 "سهمیه روزانه را وارد کنید؛ صفر یعنی بدون سقف.",
+		"flow":                        "Flow را وارد کنید؛ برای پاک‌کردن - بفرستید.",
+		"discount_tiers":              "تخفیف‌ها را با قالب ماه:درصد وارد کنید؛ نمونه 3:10,6:20. برای پاک‌کردن - بفرستید.",
+		"allowed_telegram_ids":        "شناسه‌های مجاز تلگرام را با کاما جدا کنید؛ - یعنی همه resellerهای این deployment.",
+		"usage_description":           "راهنمای مصرف را وارد کنید؛ برای پاک‌کردن - بفرستید.",
+	}
+	if prompt := prompts[field]; prompt != "" {
+		return prompt
+	}
+	return "مقدار جدید را وارد کنید."
+}
+
+func planFieldValue(p plan, field string) string {
+	switch field {
+	case "discount_tiers":
+		return planDiscountLabel(p.DiscountTiers)
+	case "allowed_telegram_ids":
+		return planAccessLabel(p.AllowedTelegramIDs)
+	case "max_data_gb":
+		return formatPlanData(p.MaxBytes)
+	case "expire_seconds":
+		return humanDuration(p.ExpireSeconds)
+	case "inbound_ids":
+		return planInboundNames(p.InboundIDs)
+	case "base_price_toman":
+		return formatToman(p.BasePrice)
+	case "price_per_gb_toman":
+		return formatToman(p.PriceGB)
+	case "price_per_extra_ip_toman":
+		return formatToman(p.PriceExtraIP)
+	case "price_per_extra_month_toman":
+		return formatToman(p.PriceExtraMonth)
+	case "min_data_gb":
+		return strconv.Itoa(p.MinGB)
+	case "base_ip_limit":
+		return strconv.Itoa(p.BaseIP)
+	case "max_ip_limit":
+		return strconv.Itoa(p.MaxIP)
+	case "test_ip_limit":
+		return strconv.Itoa(p.TestIPLimit)
+	case "max_per_day":
+		return strconv.Itoa(p.MaxPerDay)
+	case "enabled":
+		return strconv.FormatBool(p.Enabled)
+	case "is_limited":
+		return strconv.FormatBool(p.IsLimited)
+	case "is_global":
+		return strconv.FormatBool(p.IsGlobal)
+	default:
+		b, err := json.Marshal(p)
+		if err != nil {
+			return ""
+		}
+		values := map[string]json.RawMessage{}
+		if err := json.Unmarshal(b, &values); err != nil {
+			return ""
+		}
+		var value string
+		if err := json.Unmarshal(values[field], &value); err == nil {
+			return value
+		}
+		return string(values[field])
+	}
 }
 func (a *botApp) configSettings(c telebot.Context, act actor) error {
 	var cfg adminConfig
@@ -1618,71 +1746,12 @@ func (a *botApp) startConfigEdit(c telebot.Context, act actor, section, field st
 		prompt = "نشانی پایه پنل را وارد کنید؛ سپس ربات از شما توکن را می‌خواهد."
 	}
 	if section == "plan" {
-		fields := []string{"name", "kind", "enabled", "is_limited", "description", "base_price_toman", "price_per_extra_ip_toman", "price_per_gb_toman", "price_per_extra_month_toman", "base_ip_limit", "max_ip_limit", "min_data_gb", "max_data_bytes", "expire_seconds", "test_ip_limit", "max_per_day", "flow", "inbound_ids", "usage_description"}
-		st := conversation{Step: "plancreate", Vals: map[string]string{"fields": strings.Join(fields, ","), "index": "0"}, Expires: time.Now().Add(30 * time.Minute)}
-		return a.askPlanField(c, act.TelegramID, st)
+		return a.startPlanDraft(c, act)
 	}
 	a.setFlow(act.TelegramID, conversation{Step: "cfgvalue", Vals: map[string]string{"section": section, "field": field}, Expires: time.Now().Add(20 * time.Minute)})
 	return a.show(c, prompt, markup([]telebot.Btn{btn("لغو", "config")}))
 }
 
-func planPrompt(field string) string {
-	prompts := map[string]string{"name": "نام طرح", "kind": "نوع: paid یا test", "enabled": "فعال: true یا false", "is_limited": "طرح حجمی است؟ true یا false", "description": "توضیحات", "base_price_toman": "قیمت پایه (تومان)", "price_per_extra_ip_toman": "هزینه هر IP اضافه (تومان)", "price_per_gb_toman": "قیمت هر GB (تومان)", "price_per_extra_month_toman": "هزینه هر ماه اضافه (تومان)", "base_ip_limit": "تعداد IP پایه", "max_ip_limit": "حداکثر IP", "min_data_gb": "حداقل GB", "max_data_bytes": "حداکثر حجم بایت", "expire_seconds": "مدت اعتبار تست به ثانیه", "test_ip_limit": "محدودیت IP تست", "max_per_day": "سهمیه روزانه تست", "flow": "Flow پنل", "inbound_ids": "شناسه‌های inbound با کاما جدا شوند", "usage_description": "راهنمای مصرف"}
-	return prompts[field]
-}
-func (a *botApp) askPlanField(c telebot.Context, id int64, st conversation) error {
-	fields := strings.Split(st.Vals["fields"], ",")
-	i, _ := strconv.Atoi(st.Vals["index"])
-	if i >= len(fields) {
-		return a.show(c, "اطلاعات طرح کامل شد.")
-	}
-	return a.setFlowAndPrompt(c, id, st, planPrompt(fields[i])+" را وارد کنید.")
-}
-func (a *botApp) collectNewPlan(c telebot.Context, act actor, st conversation, value string) error {
-	fields := strings.Split(st.Vals["fields"], ",")
-	i, _ := strconv.Atoi(st.Vals["index"])
-	if st.Vals["values"] == "" {
-		st.Vals["values"] = "{}"
-	}
-	values := map[string]string{}
-	if err := json.Unmarshal([]byte(st.Vals["values"]), &values); err != nil {
-		values = map[string]string{}
-	}
-	field := fields[i]
-	if (field == "name" || field == "kind") && strings.TrimSpace(value) == "" {
-		return a.show(c, planPrompt(field)+" الزامی است.", markup([]telebot.Btn{btn("لغو", "config")}))
-	}
-	if err := setPlanField(&plan{}, field, value); err != nil {
-		return a.show(c, "مقدار نامعتبر برای "+field+": "+err.Error(), markup([]telebot.Btn{btn("لغو", "config")}))
-	}
-	values[field] = value
-	b, _ := json.Marshal(values)
-	st.Vals["values"] = string(b)
-	i++
-	st.Vals["index"] = strconv.Itoa(i)
-	if i < len(fields) {
-		st.Expires = time.Now().Add(30 * time.Minute)
-		a.setFlow(act.TelegramID, st)
-		return a.askPlanField(c, act.TelegramID, st)
-	}
-	p := plan{}
-	for name, raw := range values {
-		if err := setPlanField(&p, name, raw); err != nil {
-			st.Vals["index"] = strconv.Itoa(i - 1)
-			st.Vals["values"] = string(b)
-			a.setFlow(act.TelegramID, st)
-			return a.show(c, "مقدار نامعتبر برای "+name+": "+err.Error(), markup([]telebot.Btn{btn("لغو", "config")}))
-		}
-	}
-	if p.Name == "" || (p.Kind != "paid" && p.Kind != "test") {
-		return a.show(c, "نام الزامی و نوع باید paid یا test باشد.", markup([]telebot.Btn{btn("لغو", "config")}))
-	}
-	if err := a.call(c, "POST", "/v1/admin/config/plans", act.TelegramID, p, nil); err != nil {
-		return a.sendFailure(c, err)
-	}
-	a.clearFlow(act.TelegramID)
-	return a.configPlans(c, act)
-}
 func (a *botApp) saveConfigValue(c telebot.Context, act actor, st conversation, value string) error {
 	section, field := st.Vals["section"], st.Vals["field"]
 	payload := map[string]any{}
@@ -1833,12 +1902,21 @@ func (a *botApp) savePlanValue(c telebot.Context, act actor, st conversation, va
 	if err := setPlanField(selected, field, value); err != nil {
 		return a.show(c, "مقدار نامعتبر: "+err.Error())
 	}
+	if field == "enabled" && selected.Enabled {
+		inbounds, err := a.planInbounds(c, act.TelegramID)
+		if err != nil {
+			return a.sendFailure(c, err)
+		}
+		if err := validatePlanInboundSelection(*selected, inbounds); err != nil {
+			return a.show(c, "طرح تا زمانی که inboundهای فعال انتخاب نشوند فعال نمی‌شود: "+err.Error(), markup([]telebot.Btn{btn("انتخاب inboundها", fmt.Sprintf("planfield|%d|inbound_ids", selected.ID))}, []telebot.Btn{btn("بازگشت", fmt.Sprintf("planedit|%d", selected.ID))}))
+		}
+	}
 	payload, _ := json.Marshal(selected)
 	if err := a.call(c, "PUT", fmt.Sprintf("/v1/admin/config/plans/%d", id), act.TelegramID, json.RawMessage(payload), nil); err != nil {
 		return a.sendFailure(c, err)
 	}
 	a.clearFlow(act.TelegramID)
-	return a.planEditor(c, act, st.Vals["id"])
+	return a.planEditorWithNotice(c, act, st.Vals["id"], "✅ تغییر طرح ذخیره شد.")
 }
 
 func setPlanField(p *plan, field, raw string) error {
@@ -1852,7 +1930,11 @@ func setPlanField(p *plan, field, raw string) error {
 	parseBool := func() (bool, error) { return strconv.ParseBool(strings.TrimSpace(raw)) }
 	switch field {
 	case "name":
-		p.Name = raw
+		value := strings.TrimSpace(raw)
+		if value == "" || len([]byte(value)) > 120 {
+			return fmt.Errorf("نام باید بین ۱ تا ۱۲۰ بایت باشد")
+		}
+		p.Name = value
 	case "kind":
 		if raw != "paid" && raw != "test" {
 			return fmt.Errorf("نوع باید paid یا test باشد")
@@ -1871,6 +1953,12 @@ func setPlanField(p *plan, field, raw string) error {
 		}
 		p.IsLimited = v
 	case "description":
+		if raw == "-" {
+			raw = ""
+		}
+		if len([]byte(raw)) > 2048 {
+			return fmt.Errorf("توضیحات حداکثر ۲۰۴۸ بایت باشد")
+		}
 		p.Description = raw
 	case "base_price_toman":
 		v, e := parseInt(64)
@@ -1898,19 +1986,28 @@ func setPlanField(p *plan, field, raw string) error {
 		p.PriceExtraMonth = v
 	case "base_ip_limit":
 		v, e := parseInt(32)
-		if e != nil {
+		if e != nil || v > 10000 {
+			if e == nil {
+				e = fmt.Errorf("حداکثر تعداد IP برابر ۱۰۰۰۰ است")
+			}
 			return e
 		}
 		p.BaseIP = int(v)
 	case "max_ip_limit":
 		v, e := parseInt(32)
-		if e != nil {
+		if e != nil || v > 10000 {
+			if e == nil {
+				e = fmt.Errorf("حداکثر تعداد IP برابر ۱۰۰۰۰ است")
+			}
 			return e
 		}
 		p.MaxIP = int(v)
 	case "min_data_gb":
 		v, e := parseInt(32)
-		if e != nil {
+		if e != nil || v > 100000 {
+			if e == nil {
+				e = fmt.Errorf("حداقل حجم حداکثر ۱۰۰۰۰۰ GB است")
+			}
 			return e
 		}
 		p.MinGB = int(v)
@@ -1920,28 +2017,51 @@ func setPlanField(p *plan, field, raw string) error {
 			return e
 		}
 		p.MaxBytes = v
+	case "max_data_gb":
+		gb, e := strconv.ParseFloat(strings.TrimSpace(raw), 64)
+		bytes := gb * float64(uint64(1)<<30)
+		if e != nil || math.IsNaN(gb) || math.IsInf(gb, 0) || gb < 0 || bytes >= float64(math.MaxInt64) {
+			return fmt.Errorf("حجم باید صفر یا عددی مثبت و محدود باشد")
+		}
+		p.MaxBytes = int64(bytes)
 	case "expire_seconds":
 		v, e := parseInt(64)
-		if e != nil {
+		if e != nil || v > maxResellerPlanLifetimeSeconds {
+			if e == nil {
+				e = fmt.Errorf("مدت حداکثر ده سال است")
+			}
 			return e
 		}
 		p.ExpireSeconds = v
 	case "test_ip_limit":
 		v, e := parseInt(32)
-		if e != nil {
+		if e != nil || v > 10000 {
+			if e == nil {
+				e = fmt.Errorf("حداکثر IP تست برابر ۱۰۰۰۰ است")
+			}
 			return e
 		}
 		p.TestIPLimit = int(v)
 	case "max_per_day":
 		v, e := parseInt(32)
-		if e != nil {
+		if e != nil || v > 10000 {
+			if e == nil {
+				e = fmt.Errorf("سهمیه روزانه حداکثر ۱۰۰۰۰ است")
+			}
 			return e
 		}
 		p.MaxPerDay = int(v)
 	case "flow":
+		if raw == "-" {
+			raw = ""
+		}
+		if len([]byte(raw)) > 120 {
+			return fmt.Errorf("Flow حداکثر ۱۲۰ بایت باشد")
+		}
 		p.Flow = raw
 	case "inbound_ids":
 		p.InboundIDs = []int{}
+		seen := make(map[int]struct{})
 		for _, part := range strings.Split(raw, ",") {
 			part = strings.TrimSpace(part)
 			if part == "" {
@@ -1951,9 +2071,32 @@ func setPlanField(p *plan, field, raw string) error {
 			if e != nil || v <= 0 {
 				return fmt.Errorf("شناسه inbound نامعتبر است")
 			}
+			if _, exists := seen[v]; exists {
+				return fmt.Errorf("شناسه inbound تکراری است")
+			}
+			seen[v] = struct{}{}
 			p.InboundIDs = append(p.InboundIDs, v)
 		}
+	case "discount_tiers":
+		tiers, e := parsePlanDiscounts(raw)
+		if e != nil {
+			return e
+		}
+		p.DiscountTiers = tiers
+	case "allowed_telegram_ids":
+		ids, e := parsePlanAccess(raw)
+		if e != nil {
+			return e
+		}
+		p.AllowedTelegramIDs = ids
+		p.IsGlobal = len(ids) == 0
 	case "usage_description":
+		if raw == "-" {
+			raw = ""
+		}
+		if len([]byte(raw)) > 4096 {
+			return fmt.Errorf("راهنما حداکثر ۴۰۹۶ بایت باشد")
+		}
 		p.UsageDescription = raw
 	default:
 		return fmt.Errorf("فیلد پشتیبانی نمی‌شود")
@@ -1999,5 +2142,46 @@ func short(s string, n int) string {
 	return s
 }
 func (a *botApp) sendFailure(c telebot.Context, err error) error {
-	return a.show(c, "درخواست انجام نشد: "+err.Error(), markup([]telebot.Btn{btn("بازگشت به خانه", "home")}))
+	status, category := resellerFailureDiagnostic(err)
+	if status > 0 {
+		log.Printf("reseller action failed: category=%s status=%d", category, status)
+	} else {
+		log.Printf("reseller action failed: category=%s", category)
+	}
+	return a.show(c, "درخواست انجام نشد. "+resellerFailureHint(err), markup([]telebot.Btn{btn("بازگشت به خانه", "home")}))
+}
+
+func resellerFailureDiagnostic(err error) (int, string) {
+	var apiErr *backend.APIError
+	if !errors.As(err, &apiErr) {
+		return 0, "transport_or_internal"
+	}
+	code := apiErr.Code
+	if code == "" || len(code) > 48 {
+		return apiErr.Status, "backend_error"
+	}
+	for _, r := range code {
+		if !(r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '_' || r == '-') {
+			return apiErr.Status, "backend_error"
+		}
+	}
+	return apiErr.Status, code
+}
+
+func resellerFailureHint(err error) string {
+	status, category := resellerFailureDiagnostic(err)
+	if status == 400 {
+		var apiErr *backend.APIError
+		if errors.As(err, &apiErr) && apiErr.Code == "invalid_request" {
+			message := strings.Join(strings.Fields(apiErr.Message), " ")
+			if message != "" && len([]rune(message)) <= 300 {
+				return "داده‌های ارسالی پذیرفته نشدند (HTTP 400): " + message
+			}
+		}
+		return "داده‌های ارسالی پذیرفته نشدند (HTTP 400). فیلدها را بررسی کنید."
+	}
+	if status > 0 {
+		return fmt.Sprintf("خطای backend (HTTP %d، %s).", status, category)
+	}
+	return "ارتباط با backend کامل نشد."
 }

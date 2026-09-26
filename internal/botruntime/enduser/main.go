@@ -661,7 +661,18 @@ func (a *botApp) freshHome(c telebot.Context, message string) error {
 	return c.Send(text, m)
 }
 
-func (a *botApp) callbackFailure(c telebot.Context, action string, st conversation) error {
+func (a *botApp) callbackFailure(c telebot.Context, action string, st conversation, cause error) error {
+	if action == "draft-save" && st.Draft != nil {
+		status, category := failureDiagnostic(cause)
+		st.Admin = ""
+		st = a.next(st)
+		a.setState(c.Sender().ID, st)
+		st = a.state(c.Sender().ID)
+		message := fmt.Sprintf("ذخیره طرح تأیید نشد. پیش‌نویس نگه داشته شده است. خطا: %s (HTTP %d). پیش از تلاش دوباره، فهرست طرح‌ها را تازه کنید تا از ذخیره‌شدن احتمالی مطمئن شوید.", category, status)
+		m := &telebot.ReplyMarkup{}
+		m.Inline(m.Row(m.Data("↩️ پیش‌نویس", "nav", st.Nonce, "draft-back")), m.Row(m.Data("🔄 تازه‌سازی فهرست طرح‌ها", "nav", st.Nonce, "config-plans")), m.Row(m.Data("❌ لغو", "nav", st.Nonce, "draft-cancel")))
+		return present(c, message, m, true)
+	}
 	if (action == "method-wallet" || action == "method-direct" || action == "retry-purchase") && st.QuoteID > 0 {
 		st.Step = ""
 		st = a.next(st)
@@ -704,7 +715,14 @@ func menuText(features publicFeatures, key, fallback string) string {
 }
 func present(c telebot.Context, message string, markup *telebot.ReplyMarkup, edit bool) error {
 	if edit {
-		return c.Edit(message, markup)
+		if err := c.Edit(message, markup); err == nil {
+			return nil
+		}
+		if callback := c.Callback(); callback != nil && callback.Message != nil {
+			if bot := c.Bot(); bot != nil {
+				_, _ = bot.EditReplyMarkup(callback.Message, &telebot.ReplyMarkup{})
+			}
+		}
 	}
 	return c.Send(message, markup)
 }
@@ -749,7 +767,7 @@ func (a *botApp) callback(c telebot.Context) error {
 	if err := a.route(c, command, args, st); err != nil {
 		status, category := failureDiagnostic(err)
 		log.Printf("callback route failed: category=%s status=%d", category, status)
-		return a.callbackFailure(c, command, st)
+		return a.callbackFailure(c, command, st, err)
 	}
 	return nil
 }
@@ -3102,13 +3120,28 @@ func (a *botApp) createPlan(c telebot.Context, p *adminPlan) error {
 	if err = a.api.Call(ctx, "POST", "/v1/admin/config/plans", act.TelegramID, p, &result); err != nil {
 		return sendFailure(c, err)
 	}
+	if result.ID <= 0 {
+		return a.callbackFailure(c, "draft-save", a.state(c.Sender().ID), fmt.Errorf("plan create response omitted its ID"))
+	}
 	a.resetPlanEditorState(c)
 	for _, created := range result.Config.Plans {
 		if created.ID == result.ID {
-			return a.planEditor(c, created, c.Callback() != nil)
+			return present(c, fmt.Sprintf("✅ طرح شماره %d در backend ذخیره و دوباره خوانده شد.\n\nتنظیم طرح %s.", created.ID, created.Name), planEditorMarkup(a.state(c.Sender().ID), created), c.Callback() != nil)
 		}
 	}
-	return a.adminPlans(c, c.Callback() != nil)
+	var refreshed adminConfig
+	if err = a.api.Call(ctx, "GET", "/v1/admin/config", act.TelegramID, nil, &refreshed); err == nil {
+		for _, created := range refreshed.Plans {
+			if created.ID == result.ID {
+				a.resetPlanEditorState(c)
+				return present(c, fmt.Sprintf("✅ طرح شماره %d در backend ذخیره و دوباره خوانده شد.\n\nتنظیم طرح %s.", created.ID, created.Name), planEditorMarkup(a.state(c.Sender().ID), created), c.Callback() != nil)
+			}
+		}
+	}
+	st := a.state(c.Sender().ID)
+	m := &telebot.ReplyMarkup{}
+	m.Inline(m.Row(m.Data("🔄 تازه‌سازی فهرست طرح‌ها", "nav", st.Nonce, "config-plans")), m.Row(m.Data("🏠 مدیریت", "nav", st.Nonce, "config")))
+	return present(c, fmt.Sprintf("طرح شماره %d ذخیره شد، اما تأیید دوباره از پیکربندی ناموفق بود. فهرست طرح‌ها را تازه کنید.", result.ID), m, c.Callback() != nil)
 }
 func (a *botApp) updatePlan(c telebot.Context, p adminPlan) error {
 	act, err := a.requireRetailAdmin(c)
@@ -3500,16 +3533,29 @@ func callbackOperationKey(c telebot.Context, operation, target string) string {
 }
 func sendFailure(c telebot.Context, err error) error {
 	status, category := failureDiagnostic(err)
-	log.Printf("user action failed: category=%s status=%d", category, status)
+	if operation := failureOperation(err); operation != "" {
+		log.Printf("user action failed: category=%s status=%d operation=%q", category, status, operation)
+	} else {
+		log.Printf("user action failed: category=%s status=%d", category, status)
+	}
 	if c.Callback() != nil {
 		if app, ok := c.Get("retail_bot_app").(*botApp); ok {
 			action, _ := c.Get("retail_callback_action").(string)
 			st, _ := c.Get("retail_callback_state").(conversation)
-			return app.callbackFailure(c, action, st)
+			return app.callbackFailure(c, action, st, err)
 		}
 	}
 	return c.Send("درخواست انجام نشد. لطفاً دوباره از منو تلاش کنید یا با پشتیبانی تماس بگیرید.")
 }
+
+func failureOperation(err error) string {
+	var apiErr *backend.APIError
+	if !errors.As(err, &apiErr) || apiErr.Method == "" || !strings.HasPrefix(apiErr.Path, "/v1/") || strings.Contains(apiErr.Path, "?") {
+		return ""
+	}
+	return apiErr.Method + " " + apiErr.Path
+}
+
 func failureDiagnostic(err error) (int, string) {
 	var apiErr *backend.APIError
 	if errors.As(err, &apiErr) {
