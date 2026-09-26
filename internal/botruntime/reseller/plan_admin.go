@@ -542,7 +542,7 @@ func (a *botApp) showPlanDraftInbounds(c telebot.Context, act actor, st conversa
 		} else if !inbound.Enable {
 			mark = "⛔"
 		}
-		label := fmt.Sprintf("%s %d · %s · %s:%d", mark, inbound.ID, short(inbound.Remark, 22), inbound.Protocol, inbound.Port)
+		label := planInboundOptionLabel(mark, inbound)
 		rows = append(rows, []telebot.Btn{btn(label, fmt.Sprintf("planinbound|toggle|%d", inbound.ID))})
 	}
 	if len(available) > resellerPlanInboundPageSize {
@@ -694,6 +694,14 @@ func planKindLabel(kind string) string {
 		return "تست"
 	}
 	return "پولی"
+}
+
+func planPickerLabel(p plan) string {
+	return fmt.Sprintf("%s · %s · %t", short(p.Name, 40), p.Kind, p.Enabled)
+}
+
+func planInboundOptionLabel(mark string, inbound panelInbound) string {
+	return fmt.Sprintf("%s %d · %s · %s:%d", mark, inbound.ID, short(inbound.Remark, 18), short(inbound.Protocol, 8), inbound.Port)
 }
 
 func planInboundNames(ids []int) string {

@@ -272,6 +272,17 @@ func TestPlanInboundSelectionAndPagingStaySortedAndBounded(t *testing.T) {
 	}
 }
 
+func TestPlanAdminButtonLabelsFitTelegramLimits(t *testing.T) {
+	p := plan{Name: strings.Repeat("套餐", 60), Kind: "paid", Enabled: true}
+	if got := len([]rune(planPickerLabel(p))); got > 64 {
+		t.Fatalf("plan picker label has %d runes", got)
+	}
+	inbound := panelInbound{ID: 123456789, Remark: strings.Repeat("入口", 40), Protocol: strings.Repeat("vless", 30), Port: 443}
+	if got := len([]rune(planInboundOptionLabel("✅", inbound))); got > 64 {
+		t.Fatalf("inbound option label has %d runes", got)
+	}
+}
+
 func TestPlanManagementCallbacksAreAdminOnly(t *testing.T) {
 	for _, action := range []string{"plannewkind", "plandraft", "planinbound"} {
 		if !adminCallbackAction(action) {

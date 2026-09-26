@@ -1568,7 +1568,7 @@ func (a *botApp) configPlans(c telebot.Context, act actor) error {
 	}
 	rows := make([][]telebot.Btn, 0, len(cfg.Plans)+2)
 	for _, p := range cfg.Plans {
-		rows = append(rows, []telebot.Btn{btn(fmt.Sprintf("%s · %s · %t", p.Name, p.Kind, p.Enabled), fmt.Sprintf("planedit|%d", p.ID))})
+		rows = append(rows, []telebot.Btn{btn(planPickerLabel(p), fmt.Sprintf("planedit|%d", p.ID))})
 	}
 	rows = append(rows, []telebot.Btn{btn("ایجاد طرح", "cfgset|plan|new")}, []telebot.Btn{btn("بازگشت", "config")})
 	return a.show(c, "طرح را برای ویرایش قیمت‌ها و مشخصات انتخاب کنید.", markup(rows...))
