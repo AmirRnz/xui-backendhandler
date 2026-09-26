@@ -12,7 +12,7 @@ import (
 
 func adminCallbackAction(action string) bool {
 	switch action {
-	case "admin", "pending", "pendingtopups", "pendingpage", "resellers", "resellerpage", "resapprove", "resreject", "approve", "approvetopup", "review-payment", "review-topup", "reject-payment", "reject-topup", "confirm-review-reject", "review-refund", "reject-refund", "confirm-refund-reject", "work-items", "refunds", "config", "cfg", "cfgset", "planedit", "planfield", "feature":
+	case "admin", "pending", "pendingtopups", "pendingpage", "resellers", "resellerpage", "resapprove", "resreject", "approve", "approvetopup", "review-payment", "review-topup", "reject-payment", "reject-topup", "confirm-review-reject", "review-refund", "reject-refund", "confirm-refund-reject", "work-items", "refunds", "config", "cfg", "cfgset", "planedit", "planfield", "plannewkind", "plandraft", "planinbound", "feature":
 		return true
 	default:
 		return false

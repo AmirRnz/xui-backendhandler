@@ -10,11 +10,13 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
 
 	"example.com/xui-commerce/backend/internal/api"
+	"example.com/xui-commerce/backend/internal/commerce"
 	"example.com/xui-commerce/backend/internal/config"
 	"example.com/xui-commerce/backend/internal/store"
 	"example.com/xui-commerce/backend/internal/xui"
@@ -196,6 +198,58 @@ func TestAdminConfigIsDeploymentScopedAndSecretsAreWriteOnly(t *testing.T) {
 	}
 	if err := s.DB.QueryRow(ctx, `SELECT is_global FROM plans WHERE deployment_id='retail-finland' AND id=$1`, restricted.ID).Scan(&isGlobal); err != nil || !isGlobal {
 		t.Fatalf("empty allowlist should make plan global: global=%t err=%v", isGlobal, err)
+	}
+}
+
+func TestAdminCreateEnabledPlanPersistsInboundIDsAndReadsItBack(t *testing.T) {
+	s, _ := testStore(t)
+	const token = "retail-finland-plan-create-test-token-000000"
+	handler := api.New(s, config.Config{ClientCredentials: []config.ClientCredential{{DeploymentID: "retail-finland", Token: token}}}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	input := store.AdminPlan{
+		Name: "Plan create integration", Kind: "paid", Enabled: true,
+		BasePriceToman: 25000, BaseIPLimit: 1, MaxIPLimit: 4,
+		InboundIDs: []int{12, 21}, DiscountTiers: []commerce.DiscountTier{{Months: 3, BasisPoints: 500}},
+		IsGlobal: true, AllowedTelegramIDs: []int64{},
+	}
+	body, err := json.Marshal(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/v1/admin/config/plans", bytes.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("X-Actor-Telegram-ID", "96937669")
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("create enabled plan status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var response struct {
+		ID     int64                    `json:"id"`
+		Config store.AdminConfiguration `json:"config"`
+	}
+	if err = json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode create response: %v", err)
+	}
+	var saved *store.AdminPlan
+	for i := range response.Config.Plans {
+		if response.Config.Plans[i].ID == response.ID {
+			saved = &response.Config.Plans[i]
+			break
+		}
+	}
+	if response.ID <= 0 || response.Config.DeploymentID != "retail-finland" || saved == nil {
+		t.Fatalf("create response did not read back plan %d for correct deployment: %+v", response.ID, response.Config)
+	}
+	if !reflect.DeepEqual(saved.InboundIDs, input.InboundIDs) || saved.Name != input.Name || len(saved.DiscountTiers) != 1 || saved.DiscountTiers[0].BasisPoints != 500 {
+		t.Fatalf("created plan readback mismatch: %+v", saved)
+	}
+	var inboundIDs []int32
+	if err = s.DB.QueryRow(context.Background(), `SELECT inbound_ids FROM plans WHERE deployment_id='retail-finland' AND id=$1`, response.ID).Scan(&inboundIDs); err != nil {
+		t.Fatalf("read persisted inbound array: %v", err)
+	}
+	if !reflect.DeepEqual(inboundIDs, []int32{12, 21}) {
+		t.Fatalf("persisted inbounds = %v, want [12 21]", inboundIDs)
 	}
 }
 

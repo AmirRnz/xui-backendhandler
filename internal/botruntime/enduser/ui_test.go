@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -22,6 +23,30 @@ type retailTextContext struct {
 	text    string
 	sent    interface{}
 	opts    []interface{}
+}
+
+type retailPlanContext struct {
+	telebot.Context
+	sender   *telebot.User
+	chat     *telebot.Chat
+	callback *telebot.Callback
+	editErr  error
+	edited   interface{}
+	sent     interface{}
+	opts     []interface{}
+}
+
+func (c *retailPlanContext) Sender() *telebot.User       { return c.sender }
+func (c *retailPlanContext) Chat() *telebot.Chat         { return c.chat }
+func (c *retailPlanContext) Callback() *telebot.Callback { return c.callback }
+func (c *retailPlanContext) Bot() *telebot.Bot           { return nil }
+func (c *retailPlanContext) Edit(what interface{}, opts ...interface{}) error {
+	c.edited, c.opts = what, opts
+	return c.editErr
+}
+func (c *retailPlanContext) Send(what interface{}, opts ...interface{}) error {
+	c.sent, c.opts = what, opts
+	return nil
 }
 
 func (c *retailTextContext) Sender() *telebot.User     { return c.sender }
@@ -266,6 +291,128 @@ func TestAdminTextInputCanStartNewPlanFlow(t *testing.T) {
 	}
 	if keyboard == nil || len(keyboard.InlineKeyboard) == 0 || len(keyboard.InlineKeyboard[0]) != 2 {
 		t.Fatalf("new plan kind keyboard = %#v", keyboard)
+	}
+}
+
+func TestRetailPlanCreatePostsAndConfirmsBackendReadback(t *testing.T) {
+	var posted adminPlan
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.Method + " " + r.URL.Path {
+		case "POST /v1/actors/resolve":
+			_, _ = w.Write([]byte(`{"telegram_id":96937669,"role":"admin","approval_status":"approved"}`))
+		case "GET /v1/admin/config":
+			_, _ = w.Write([]byte(`{"deployment_id":"retail-test","channel":"retail"}`))
+		case "POST /v1/admin/config/plans":
+			if r.Header.Get("X-Actor-Telegram-ID") != "96937669" {
+				t.Errorf("admin actor header = %q", r.Header.Get("X-Actor-Telegram-ID"))
+			}
+			if err := json.NewDecoder(r.Body).Decode(&posted); err != nil {
+				t.Errorf("decode plan payload: %v", err)
+				http.Error(w, "invalid body", http.StatusBadRequest)
+				return
+			}
+			saved := posted
+			saved.ID = 71
+			w.WriteHeader(http.StatusCreated)
+			_ = json.NewEncoder(w).Encode(map[string]any{"id": saved.ID, "config": adminConfig{DeploymentID: "retail-test", Channel: "retail", Plans: []adminPlan{saved}}})
+		default:
+			t.Errorf("unexpected plan request: %s %s", r.Method, r.URL.Path)
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	api, err := backend.New(server.URL, "test-secret", time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	app := &botApp{api: api, states: map[int64]conversation{}}
+	draft := defaultPlanDraft("Retail plan", "paid")
+	draft.BasePrice = 25000
+	draft.InboundIDs = []int64{12, 21}
+	draft.DiscountTiers = []discountTier{{Months: 3, BasisPoints: 500}}
+	callback := &telebot.Callback{Message: &telebot.Message{ID: 3, Chat: &telebot.Chat{ID: adminTelegramID, Type: telebot.ChatPrivate}}}
+	ctx := &retailPlanContext{sender: &telebot.User{ID: adminTelegramID}, chat: callback.Message.Chat, callback: callback}
+	if err := app.createPlan(ctx, draft); err != nil {
+		t.Fatalf("create retail plan: %v", err)
+	}
+	if posted.Name != draft.Name || posted.Kind != "paid" || posted.BasePrice != 25000 || !reflect.DeepEqual(posted.InboundIDs, []int64{12, 21}) || len(posted.DiscountTiers) != 1 {
+		t.Fatalf("plan payload mismatch: %+v", posted)
+	}
+	if text, ok := ctx.edited.(string); !ok || !strings.Contains(text, "طرح شماره 71 در backend ذخیره و دوباره خوانده شد") {
+		t.Fatalf("success screen did not confirm backend readback: %#v", ctx.edited)
+	}
+	if app.state(adminTelegramID).Draft != nil {
+		t.Fatal("successful plan create retained the stale draft")
+	}
+}
+
+func TestCallbackSaveFailureRetainsRetailPlanDraftAndRecoveryMenu(t *testing.T) {
+	app := &botApp{states: map[int64]conversation{}}
+	draft := defaultPlanDraft("Retail plan", "paid")
+	state := conversation{Draft: draft}
+	app.setState(adminTelegramID, state)
+	callback := &telebot.Callback{Message: &telebot.Message{ID: 4, Chat: &telebot.Chat{ID: adminTelegramID, Type: telebot.ChatPrivate}}}
+	ctx := &retailPlanContext{sender: &telebot.User{ID: adminTelegramID}, chat: callback.Message.Chat, callback: callback}
+	err := &backend.APIError{Status: http.StatusBadRequest, Code: "invalid_request", Method: http.MethodPost, Path: "/v1/admin/config/plans"}
+	if err := app.callbackFailure(ctx, "draft-save", state, err); err != nil {
+		t.Fatalf("render plan save recovery: %v", err)
+	}
+	if got := app.state(adminTelegramID).Draft; got == nil || got.Name != draft.Name {
+		t.Fatalf("failed save lost the plan draft: %#v", got)
+	}
+	if text, ok := ctx.edited.(string); !ok || !strings.Contains(text, "HTTP 400") || !strings.Contains(text, "پیش‌نویس نگه داشته شده") {
+		t.Fatalf("failure screen did not explain and retain draft: %#v", ctx.edited)
+	}
+	markup := &telebot.ReplyMarkup{}
+	for _, opt := range ctx.opts {
+		if candidate, ok := opt.(*telebot.ReplyMarkup); ok {
+			markup = candidate
+		}
+	}
+	encoded, _ := json.Marshal(markup.InlineKeyboard)
+	for _, action := range []string{"draft-back", "config-plans", "draft-cancel"} {
+		if !strings.Contains(string(encoded), action) {
+			t.Errorf("failure recovery menu lacks %q: %s", action, encoded)
+		}
+	}
+}
+
+func TestPresentFallsBackWhenTelegramCannotEditCallbackMessage(t *testing.T) {
+	callback := &telebot.Callback{Message: &telebot.Message{ID: 5, Chat: &telebot.Chat{ID: 42, Type: telebot.ChatPrivate}}}
+	ctx := &retailPlanContext{sender: &telebot.User{ID: 42}, chat: callback.Message.Chat, callback: callback, editErr: fmt.Errorf("message to edit not found")}
+	if err := present(ctx, "saved", &telebot.ReplyMarkup{}, true); err != nil {
+		t.Fatalf("present fallback: %v", err)
+	}
+	if ctx.sent != "saved" {
+		t.Fatalf("edit failure was not followed by a user-visible message: %#v", ctx.sent)
+	}
+}
+
+func TestRetailPlanDraftSummaryStaysWithinTelegramLimit(t *testing.T) {
+	app := &botApp{states: map[int64]conversation{}}
+	draft := defaultPlanDraft("Plan", "paid")
+	draft.Description = strings.Repeat("説明", 1000)
+	draft.UsageDescription = strings.Repeat("راهنما", 1000)
+	draft.DiscountTiers = make([]discountTier, 36)
+	for i := range draft.DiscountTiers {
+		draft.DiscountTiers[i] = discountTier{Months: i + 1, BasisPoints: 100}
+	}
+	draft.AllowedTelegramIDs = make([]int64, 256)
+	for i := range draft.AllowedTelegramIDs {
+		draft.AllowedTelegramIDs[i] = int64(i + 1000000000)
+	}
+	for i := 1; i <= 64; i++ {
+		draft.InboundIDs = append(draft.InboundIDs, int64(i))
+	}
+	app.setState(adminTelegramID, conversation{Draft: draft})
+	ctx := &retailTextContext{sender: &telebot.User{ID: adminTelegramID}, chat: &telebot.Chat{ID: adminTelegramID, Type: telebot.ChatPrivate}}
+	if err := app.showPlanDraft(ctx, false); err != nil {
+		t.Fatalf("render large retail plan draft: %v", err)
+	}
+	text, ok := ctx.sent.(string)
+	if !ok || len([]rune(text)) > 4096 {
+		t.Fatalf("retail plan summary has invalid Telegram length: %d", len([]rune(fmt.Sprint(ctx.sent))))
 	}
 }
 

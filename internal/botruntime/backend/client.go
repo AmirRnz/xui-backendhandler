@@ -19,6 +19,7 @@ type Client struct {
 type APIError struct {
 	Status        int
 	Code, Message string
+	Method, Path  string
 }
 
 func (e *APIError) Error() string { return fmt.Sprintf("backend %s: %s", e.Code, e.Message) }
@@ -76,7 +77,7 @@ func (c *Client) Call(ctx context.Context, method, path string, telegramID int64
 			} `json:"error"`
 		}
 		_ = json.Unmarshal(data, &e)
-		return &APIError{Status: resp.StatusCode, Code: e.Error.Code, Message: e.Error.Message}
+		return &APIError{Status: resp.StatusCode, Code: e.Error.Code, Message: e.Error.Message, Method: method, Path: path}
 	}
 	if out != nil && len(data) > 0 {
 		if err = json.Unmarshal(data, out); err != nil {

@@ -106,9 +106,9 @@ func (a *botApp) showPlanDraft(c telebot.Context, edit bool) error {
 	}
 	var b strings.Builder
 	fmt.Fprintf(&b, "تنظیم پیش‌نویس طرح %s\n\n", draftKindLabel(p.Kind))
-	fmt.Fprintf(&b, "نام: %s\nتوضیحات: %s\nراهنما: %s\n", valueOrDash(p.Name), valueOrDash(p.Description), valueOrDash(p.UsageDescription))
-	fmt.Fprintf(&b, "اینباندهای انتخاب‌شده: %s\n", formatInboundIDs(p.InboundIDs))
-	fmt.Fprintf(&b, "دسترسی: %s\nفلو: %s\n", planAccessLabel(p.IsGlobal, p.AllowedTelegramIDs), valueOrDash(p.Flow))
+	fmt.Fprintf(&b, "نام: %s\nتوضیحات: %s\nراهنما: %s\n", planSummaryText(p.Name, 120), planSummaryText(p.Description, 400), planSummaryText(p.UsageDescription, 400))
+	fmt.Fprintf(&b, "اینباندهای انتخاب‌شده: %s\n", planSummaryText(formatInboundIDs(p.InboundIDs), 400))
+	fmt.Fprintf(&b, "دسترسی: %s\nفلو: %s\n", planSummaryText(planAccessLabel(p.IsGlobal, p.AllowedTelegramIDs), 400), planSummaryText(p.Flow, 120))
 	if p.Kind == "test" {
 		fmt.Fprintf(&b, "مدت: %s\nسقف حجم: %s\nIP نمایشی: %d\n", humanDuration(p.ExpireSeconds), formatDataCap(p.MaxBytes), p.TestIPLimit)
 	} else {
@@ -117,7 +117,7 @@ func (a *botApp) showPlanDraft(c telebot.Context, edit bool) error {
 		} else {
 			fmt.Fprintf(&b, "نوع: نامحدود\nقیمت پایه: %s تومان در ماه\n", formatToman(p.BasePrice))
 		}
-		fmt.Fprintf(&b, "IP نمایشی پایه/حداکثر: %d/%d\nهزینه IP اضافه: %s تومان\nتخفیف‌ها: %s\n", p.BaseIP, p.MaxIP, formatToman(p.PricePerExtraIP), formatDiscountTiers(p.DiscountTiers))
+		fmt.Fprintf(&b, "IP نمایشی پایه/حداکثر: %d/%d\nهزینه IP اضافه: %s تومان\nتخفیف‌ها: %s\n", p.BaseIP, p.MaxIP, formatToman(p.PricePerExtraIP), planSummaryText(formatDiscountTiers(p.DiscountTiers), 400))
 	}
 	markup := &telebot.ReplyMarkup{}
 	rows := []telebot.Row{
@@ -714,6 +714,18 @@ func valueOrDash(s string) string {
 		return "—"
 	}
 	return strings.TrimSpace(s)
+}
+
+func planSummaryText(value string, maxRunes int) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "—"
+	}
+	runes := []rune(value)
+	if len(runes) > maxRunes {
+		return string(runes[:maxRunes]) + "…"
+	}
+	return value
 }
 
 func planEditorMarkup(st conversation, p adminPlan) *telebot.ReplyMarkup {

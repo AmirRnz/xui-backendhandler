@@ -282,7 +282,7 @@ func TestTopupMinimumValidation(t *testing.T) {
 }
 
 func TestAdminCallbackRouteClassificationCoversPrivateAdminScreens(t *testing.T) {
-	for _, action := range []string{"admin", "pending", "pendingtopups", "pendingpage", "resellers", "resellerpage", "approve", "approvetopup", "review-payment", "review-topup", "reject-payment", "reject-topup", "confirm-review-reject", "review-refund", "reject-refund", "confirm-refund-reject", "work-items", "refunds", "config", "cfg", "cfgset", "planedit", "planfield", "feature"} {
+	for _, action := range []string{"admin", "pending", "pendingtopups", "pendingpage", "resellers", "resellerpage", "approve", "approvetopup", "review-payment", "review-topup", "reject-payment", "reject-topup", "confirm-review-reject", "review-refund", "reject-refund", "confirm-refund-reject", "work-items", "refunds", "config", "cfg", "cfgset", "planedit", "planfield", "plannewkind", "plandraft", "planinbound", "feature"} {
 		if !adminCallbackAction(action) {
 			t.Errorf("admin route %q is not subject to private-chat gate", action)
 		}
@@ -292,7 +292,7 @@ func TestAdminCallbackRouteClassificationCoversPrivateAdminScreens(t *testing.T)
 			t.Errorf("customer route %q should not be classified as admin-only", action)
 		}
 	}
-	for _, step := range []string{"cfgvalue", "cfgtextkey", "planvalue", "plancreate", "paneltoken"} {
+	for _, step := range []string{"cfgvalue", "cfgtextkey", "planvalue", "paneltoken", "plan-draft-name", "plan-draft-field"} {
 		if !adminFlowStep(step) {
 			t.Errorf("admin text step %q is not subject to private-chat gate", step)
 		}

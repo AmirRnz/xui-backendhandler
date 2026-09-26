@@ -191,6 +191,17 @@ func TestFailureDiagnosticUsesOnlySanitizedBackendCategory(t *testing.T) {
 	}
 }
 
+func TestFailureOperationLogsSafeBackendRouteWithoutQuery(t *testing.T) {
+	err := &backend.APIError{Method: "POST", Path: "/v1/admin/config/plans", Status: 403}
+	if got := failureOperation(err); got != "POST /v1/admin/config/plans" {
+		t.Fatalf("safe operation = %q", got)
+	}
+	err.Path = "/v1/plans?kind=test"
+	if got := failureOperation(err); got != "" {
+		t.Fatalf("query-bearing operation should be omitted, got %q", got)
+	}
+}
+
 func TestPanelURLPromptRequiresPrivateChat(t *testing.T) {
 	stateSet, promptSent := false, false
 	err := beginPanelURLPrompt(&telebot.Chat{Type: telebot.ChatGroup}, func() {
