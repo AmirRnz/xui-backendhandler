@@ -97,7 +97,14 @@ func (s *Store) ManualReviewWork(ctx context.Context, id int64, reason string, o
 		if _, err = tx.Exec(ctx, `UPDATE subscriptions SET status='manual_review',updated_at=now() WHERE id=$1`, subscription); err != nil {
 			return err
 		}
-		lookupErr := tx.QueryRow(ctx, `SELECT id FROM orders WHERE subscription_id=$1`, subscription).Scan(&orderID)
+		var workKind string
+		var accountID int64
+		lookupErr := tx.QueryRow(ctx, `SELECT kind,COALESCE(account_id,0) FROM work_items WHERE id=$1`, id).Scan(&workKind, &accountID)
+		if lookupErr == nil && workKind == "subscription_update" {
+			_, lookupErr = tx.Exec(ctx, `UPDATE orders SET status='manual_review',updated_at=now() WHERE deployment_id=(SELECT deployment_id FROM work_items WHERE id=$1) AND account_id=$2 AND operation_key=(SELECT operation_key FROM work_items WHERE id=$1)`, id, accountID)
+		} else if lookupErr == nil {
+			lookupErr = tx.QueryRow(ctx, `SELECT id FROM orders WHERE subscription_id=$1`, subscription).Scan(&orderID)
+		}
 		if lookupErr == nil && orderID > 0 {
 			if _, err = tx.Exec(ctx, `UPDATE orders SET status='manual_review',updated_at=now() WHERE id=$1`, orderID); err != nil {
 				return err
@@ -129,6 +136,8 @@ func (s *Store) SucceedWork(ctx context.Context, w *WorkItem, links []string) er
 	if w.Kind == "subscription_delete" {
 		subStatus = "cancelled"
 		topic = "subscription.cancelled"
+	} else if w.Kind == "subscription_update" {
+		topic = "subscription.updated"
 	}
 	err = tx.QueryRow(ctx, `UPDATE work_items SET status='succeeded',observed_state=jsonb_build_object('verified',true,'links',$2::jsonb),last_error='',lease_until=NULL,updated_at=now()
 		WHERE id=$1 AND status='running' RETURNING COALESCE(subscription_id,0)`, w.ID, linkJSON).Scan(&sid)
@@ -136,10 +145,17 @@ func (s *Store) SucceedWork(ctx context.Context, w *WorkItem, links []string) er
 		return err
 	}
 	if sid > 0 {
-		if _, err = tx.Exec(ctx, `UPDATE subscriptions SET status=$2,subscription_links=$3,updated_at=now() WHERE id=$1`, sid, subStatus, linkJSON); err != nil {
+		if w.Kind == "subscription_update" {
+			if _, err = tx.Exec(ctx, `UPDATE subscriptions SET status='active',ip_limit=$2,expiry_time_ms=$3,updated_at=now() WHERE id=$1`, sid, w.Desired.IPLimit, w.Desired.ExpiryTimeMS); err != nil {
+				return err
+			}
+			if _, err = tx.Exec(ctx, `UPDATE orders SET status='completed',updated_at=now() WHERE deployment_id=$1 AND account_id=$2 AND operation_key=$3`, w.DeploymentID, w.AccountID, w.OperationKey); err != nil {
+				return err
+			}
+		} else if _, err = tx.Exec(ctx, `UPDATE subscriptions SET status=$2,subscription_links=$3,updated_at=now() WHERE id=$1`, sid, subStatus, linkJSON); err != nil {
 			return err
 		}
-		if w.Kind != "subscription_delete" {
+		if w.Kind != "subscription_delete" && w.Kind != "subscription_update" {
 			if _, err = tx.Exec(ctx, `UPDATE orders SET status='completed',updated_at=now() WHERE subscription_id=$1`, sid); err != nil {
 				return err
 			}
@@ -153,8 +169,12 @@ func (s *Store) SucceedWork(ctx context.Context, w *WorkItem, links []string) er
 		if err = tx.QueryRow(ctx, `SELECT w.deployment_id,COALESCE(w.account_id,0),COALESCE(w.actor_id,0),s.client_email FROM work_items w JOIN subscriptions s ON s.id=w.subscription_id WHERE w.id=$1`, w.ID).Scan(&deployment, &account, &actor, &email); err != nil {
 			return err
 		}
-		payload, _ := json.Marshal(map[string]any{"subscription_id": sid, "email": email, "links": links, "status": subStatus})
-		if _, err = tx.Exec(ctx, `INSERT INTO outbox(deployment_id,account_id,actor_id,dedupe_key,topic,payload) VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT(deployment_id,dedupe_key) DO NOTHING`, deployment, account, actor, topic+":"+fmt.Sprint(sid), topic, payload); err != nil {
+		payload, _ := json.Marshal(map[string]any{"subscription_id": sid, "email": email, "links": links, "status": subStatus, "action": w.Desired.MutationAction, "ip_limit": w.Desired.IPLimit, "expiry_time_ms": w.Desired.ExpiryTimeMS})
+		dedupe := topic + ":" + fmt.Sprint(sid)
+		if w.Kind == "subscription_update" {
+			dedupe = topic + ":" + fmt.Sprint(w.ID)
+		}
+		if _, err = tx.Exec(ctx, `INSERT INTO outbox(deployment_id,account_id,actor_id,dedupe_key,topic,payload) VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT(deployment_id,dedupe_key) DO NOTHING`, deployment, account, actor, dedupe, topic, payload); err != nil {
 			return err
 		}
 	}
@@ -197,6 +217,13 @@ func (s *Store) CancelSubscription(ctx context.Context, a *Actor, id int64, key 
 	}
 	if err != nil {
 		return 0, err
+	}
+	var pendingMutation bool
+	if err = tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM orders WHERE deployment_id=$1 AND account_id=$2 AND subscription_id=$3 AND status IN ('awaiting_payment','provisioning','manual_review'))`, a.DeploymentID, a.AccountID, id).Scan(&pendingMutation); err != nil {
+		return 0, err
+	}
+	if pendingMutation {
+		return 0, ErrConflict
 	}
 	if status != "active" && status != "expired" {
 		var workID int64

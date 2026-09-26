@@ -44,7 +44,7 @@ func TestFeatureGateDefaultsEnabledAndHonorsDisabledFlags(t *testing.T) {
 }
 
 func TestPlanFieldCallbackPayloadFitsTelegramLimit(t *testing.T) {
-	fields := []string{"name", "kind", "description", "base_price_toman", "price_per_extra_ip_toman", "price_per_gb_toman", "price_per_extra_month_toman", "ip_limits", "min_data_gb", "max_data_bytes", "expire_seconds", "test_ip_limit", "flow", "inbound_ids", "usage_description"}
+	fields := []string{"name", "kind", "description", "base_price_toman", "price_per_extra_ip_toman", "price_per_gb_toman", "price_per_extra_month_toman", "ip_limits", "min_data_gb", "max_data_bytes", "expire_seconds", "test_ip_limit", "max_per_day", "flow", "inbound_ids", "usage_description", "discount_tiers", "access"}
 	for _, field := range fields {
 		code := planFieldCode(field)
 		decoded, ok := planFieldFromCode(code)

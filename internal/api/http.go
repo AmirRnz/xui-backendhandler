@@ -52,6 +52,8 @@ func (h *Handler) routes() {
 	h.mux.HandleFunc("POST /v1/purchases", h.purchase)
 	h.mux.HandleFunc("POST /v1/trials", h.trial)
 	h.mux.HandleFunc("GET /v1/subscriptions", h.subscriptions)
+	h.mux.HandleFunc("POST /v1/subscriptions/{id}/quotes", h.subscriptionMutationQuote)
+	h.mux.HandleFunc("POST /v1/subscriptions/{id}/mutations", h.subscriptionMutation)
 	h.mux.HandleFunc("POST /v1/subscriptions/{id}/cancel", h.cancelSubscription)
 	h.mux.HandleFunc("POST /v1/subscriptions/{id}/refunds", h.requestRefund)
 	h.mux.HandleFunc("GET /v1/wallet", h.wallet)
@@ -69,6 +71,7 @@ func (h *Handler) routes() {
 	h.mux.HandleFunc("GET /v1/admin/payments", h.pendingPayments)
 	h.mux.HandleFunc("GET /v1/admin/work-items", h.workItems)
 	h.mux.HandleFunc("GET /v1/admin/config", h.adminConfig)
+	h.mux.HandleFunc("GET /v1/admin/panels/inbounds", h.adminInbounds)
 	h.mux.HandleFunc("GET /v1/admin/resellers/pending", h.adminPendingResellers)
 	h.mux.HandleFunc("POST /v1/admin/resellers/{telegram_id}/approve", h.adminApproveReseller)
 	h.mux.HandleFunc("POST /v1/admin/resellers/{telegram_id}/reject", h.adminRejectReseller)
@@ -331,6 +334,71 @@ func (h *Handler) subscriptions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, 200, result)
+}
+
+func (h *Handler) subscriptionMutationQuote(w http.ResponseWriter, r *http.Request) {
+	a, ok := h.actor(w, r)
+	if !ok {
+		return
+	}
+	if !h.requireFeature(w, r, "purchases_enabled") {
+		return
+	}
+	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if err != nil || id <= 0 {
+		h.fail(w, store.ErrNotFound)
+		return
+	}
+	var request struct {
+		Action         string `json:"action"`
+		Months         int    `json:"months"`
+		IPLimit        int    `json:"ip_limit"`
+		IdempotencyKey string `json:"idempotency_key"`
+	}
+	if !decode(w, r, &request) {
+		return
+	}
+	result, err := h.Store.CreateSubscriptionMutationQuote(r.Context(), a, id, request.Action, request.Months, request.IPLimit, request.IdempotencyKey)
+	if err != nil {
+		h.fail(w, err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, result)
+}
+
+func (h *Handler) subscriptionMutation(w http.ResponseWriter, r *http.Request) {
+	a, ok := h.actor(w, r)
+	if !ok {
+		return
+	}
+	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if err != nil || id <= 0 {
+		h.fail(w, store.ErrNotFound)
+		return
+	}
+	var request struct {
+		QuoteID        int64  `json:"quote_id"`
+		PaymentMethod  string `json:"payment_method"`
+		IdempotencyKey string `json:"idempotency_key"`
+	}
+	if !decode(w, r, &request) {
+		return
+	}
+	if !h.requireFeature(w, r, "purchases_enabled") {
+		return
+	}
+	if request.PaymentMethod == "wallet" && !h.requireFeature(w, r, "wallet_enabled") {
+		return
+	}
+	if request.PaymentMethod == "direct" && !h.requireFeature(w, r, "direct_payments_enabled") {
+		return
+	}
+	result, err := h.Store.CreateSubscriptionMutation(r.Context(), a, id, request.QuoteID, request.PaymentMethod, request.IdempotencyKey)
+	if err != nil {
+		h.fail(w, err)
+		return
+	}
+	writeJSON(w, http.StatusAccepted, result)
 }
 func (h *Handler) cancelSubscription(w http.ResponseWriter, r *http.Request) {
 	a, ok := h.actor(w, r)

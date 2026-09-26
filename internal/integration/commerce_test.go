@@ -2,6 +2,7 @@ package integration
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -401,9 +402,13 @@ func TestRefundUsesImmutablePaidCapAndManualLegacyReview(t *testing.T) {
 
 type fakePanel struct {
 	remote                *xui.RemoteClient
+	lastAdd               *xui.ClientConfig
+	lastUpdate            *xui.ClientConfig
 	outcome               xui.Outcome
+	updateOutcome         xui.Outcome
 	createOnUnknown       bool
 	addCalls, attachCalls int
+	updateCalls           int
 	addErr                error
 }
 
@@ -417,10 +422,37 @@ func (p *fakePanel) GetClient(_ context.Context, email string) (*xui.RemoteClien
 }
 func (p *fakePanel) Add(_ context.Context, c xui.ClientConfig, inbounds []int) xui.WriteResult {
 	p.addCalls++
+	config := c
+	p.lastAdd = &config
 	if p.outcome == xui.Succeeded || p.outcome == xui.Unknown && p.createOnUnknown {
-		p.remote = &xui.RemoteClient{UUID: c.ID, Email: c.Email, SubID: c.SubID, Enable: c.Enable, ExpiryTime: c.ExpiryTime, LimitIP: c.LimitIP, TotalGB: c.TotalGB, LimitHWID: c.LimitHWID, InboundIDs: []int{inbounds[0]}}
+		p.remote = &xui.RemoteClient{UUID: c.ID, Email: c.Email, SubID: c.SubID, Enable: c.Enable, ExpiryTime: c.ExpiryTime, LimitIP: c.LimitIP, TotalGB: c.TotalGB, LimitHWID: c.LimitHWID, Comment: c.Comment, TgID: c.TgID, Flow: c.Flow, InboundIDs: []int{inbounds[0]}}
 	}
 	return xui.WriteResult{Outcome: p.outcome, Err: p.addErr}
+}
+func (p *fakePanel) Update(_ context.Context, email string, c xui.ClientConfig) xui.WriteResult {
+	p.updateCalls++
+	config := c
+	p.lastUpdate = &config
+	if p.remote != nil && p.remote.Email == email {
+		p.remote.UUID = c.ID
+		p.remote.Email = c.Email
+		p.remote.SubID = c.SubID
+		p.remote.Enable = c.Enable
+		p.remote.ExpiryTime = c.ExpiryTime
+		p.remote.LimitIP = c.LimitIP
+		p.remote.LimitHWID = c.LimitHWID
+		p.remote.TotalGB = c.TotalGB
+		p.remote.Flow = c.Flow
+		p.remote.Group = c.Group
+		p.remote.Comment = c.Comment
+		p.remote.TgID = c.TgID
+		p.remote.Extra = c.Extra
+	}
+	outcome := p.updateOutcome
+	if outcome == "" {
+		outcome = xui.Succeeded
+	}
+	return xui.WriteResult{Outcome: outcome}
 }
 func (p *fakePanel) Attach(_ context.Context, _ string, inbounds []int) error {
 	p.attachCalls++
@@ -460,6 +492,10 @@ func TestPartialInboundAndCrashAfterRemoteSuccessRecoverWithoutDuplicateAdd(t *t
 	if panel.addCalls != 1 || panel.attachCalls != 1 {
 		t.Fatalf("partial repair did not use readback: add=%d attach=%d", panel.addCalls, panel.attachCalls)
 	}
+	wantComment := xui.CustomerClientComment("recovery-plan", a.TelegramID, 1)
+	if panel.lastAdd == nil || panel.lastAdd.LimitIP != 0 || panel.lastAdd.Comment != wantComment || panel.remote.LimitIP != 0 || panel.remote.Comment != wantComment {
+		t.Fatalf("retail device cap must stay in the legacy-compatible comment while 3x-ui limitIp stays disabled: add=%+v remote=%+v", panel.lastAdd, panel.remote)
+	}
 	var subStatus string
 	var links string
 	if err = s.DB.QueryRow(ctx, `SELECT status,subscription_links::text FROM subscriptions WHERE id=$1`, purchase.SubscriptionID).Scan(&subStatus, &links); err != nil {
@@ -491,7 +527,7 @@ func TestPartialInboundAndCrashAfterRemoteSuccessRecoverWithoutDuplicateAdd(t *t
 	if err != nil {
 		t.Fatal(err)
 	}
-	panel.remote = &xui.RemoteClient{UUID: uuid, Email: email, SubID: subid, Enable: true, ExpiryTime: expiry, LimitIP: ip, TotalGB: limit, Flow: flow, InboundIDs: []int{1, 2}}
+	panel.remote = &xui.RemoteClient{UUID: uuid, Email: email, SubID: subid, Enable: true, ExpiryTime: expiry, LimitIP: 0, TotalGB: limit, Flow: flow, Comment: xui.CustomerClientComment(comment, tg, ip), TgID: tg, InboundIDs: []int{1, 2}}
 	if _, err = s.DB.Exec(ctx, `UPDATE work_items SET status='running',phase='create_attempted',lease_until=now()-interval '1 second' WHERE id=$1`, workID); err != nil {
 		t.Fatal(err)
 	}
@@ -506,6 +542,163 @@ func TestPartialInboundAndCrashAfterRemoteSuccessRecoverWithoutDuplicateAdd(t *t
 	}
 	if subStatus != "active" {
 		t.Fatalf("restart did not adopt verified remote success: %s", subStatus)
+	}
+}
+
+func TestSubscriptionMutationQuotesWalletAndDirectUpdatesPersistAndVerify(t *testing.T) {
+	s, _ := testStore(t)
+	ctx := context.Background()
+	customer := resolve(t, s, "retail-finland", 89501)
+	admin := resolve(t, s, "retail-finland", 96937669)
+	planID := addPlan(t, s, "retail-finland", "paid", "mutation-plan", 10000, 0)
+	if _, err := s.DB.Exec(ctx, `UPDATE commercial_accounts SET wallet_balance_toman=100000 WHERE id=$1`, customer.AccountID); err != nil {
+		t.Fatal(err)
+	}
+	initialQuote, err := s.CreateQuote(ctx, customer, planID, 1, 1, 0, "mutation-initial-quote")
+	if err != nil {
+		t.Fatal(err)
+	}
+	initial, err := s.CreatePurchase(ctx, customer, initialQuote.ID, "wallet", "mutation-initial", "mutation")
+	if err != nil {
+		t.Fatal(err)
+	}
+	panel := &fakePanel{outcome: xui.Succeeded}
+	runner := &worker.Runner{Store: s, Config: config.Config{PanelTokens: map[string]string{"panel-retail-finland": "test-token"}}, PanelFactory: func(context.Context, string, string) (worker.Panel, error) { return panel, nil }}
+	if err = runner.ProcessOne(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if panel.remote == nil || panel.remote.LimitIP != 0 || panel.remote.Comment != xui.CustomerClientComment("mutation-plan", customer.TelegramID, 1) {
+		t.Fatalf("initial retail client did not use the comment device marker and disabled panel limit: %+v", panel.remote)
+	}
+	if _, err = s.DB.Exec(ctx, `UPDATE subscriptions SET traffic_limit_bytes=$2 WHERE id=$1`, initial.SubscriptionID, commerce.GiB); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = s.DB.Exec(ctx, `UPDATE plans SET is_limited=true,min_data_gb=1,max_data_bytes=$2 WHERE id=$1`, planID, 2*commerce.GiB); err != nil {
+		t.Fatal(err)
+	}
+	panel.remote.TotalGB = 0
+	panel.remote.LegacyTotal = commerce.GiB
+	panel.remote.LimitIP = 7
+	panel.remote.Extra = map[string]json.RawMessage{"password": json.RawMessage(`"panel-password"`), "privateKey": json.RawMessage(`"panel-private-key"`)}
+	var originalExpiry int64
+	if err = s.DB.QueryRow(ctx, `SELECT expiry_time_ms FROM subscriptions WHERE id=$1`, initial.SubscriptionID).Scan(&originalExpiry); err != nil {
+		t.Fatal(err)
+	}
+	deviceQuote, err := s.CreateSubscriptionMutationQuote(ctx, customer, initial.SubscriptionID, "upgrade_ip", 0, 2, "mutation-device-quote")
+	if err != nil {
+		t.Fatal(err)
+	}
+	deviceQuoteReplay, err := s.CreateSubscriptionMutationQuote(ctx, customer, initial.SubscriptionID, "upgrade_ip", 0, 2, "mutation-device-quote")
+	if err != nil || deviceQuoteReplay.ID != deviceQuote.ID {
+		t.Fatalf("same device quote was not idempotent: first=%+v replay=%+v err=%v", deviceQuote, deviceQuoteReplay, err)
+	}
+	other := resolve(t, s, "retail-finland", 89502)
+	if _, err = s.CreateSubscriptionMutationQuote(ctx, other, initial.SubscriptionID, "extend", 1, 1, "foreign-mutation-quote"); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("another retail actor accessed the subscription: %v", err)
+	}
+	const concurrentPayments = 6
+	mutationResults := make([]*store.PurchaseResult, concurrentPayments)
+	mutationErrors := make([]error, concurrentPayments)
+	var mutationWG sync.WaitGroup
+	for i := 0; i < concurrentPayments; i++ {
+		mutationWG.Add(1)
+		go func(i int) {
+			defer mutationWG.Done()
+			mutationResults[i], mutationErrors[i] = s.CreateSubscriptionMutation(ctx, customer, initial.SubscriptionID, deviceQuote.ID, "wallet", "mutation-device-payment")
+		}(i)
+	}
+	mutationWG.Wait()
+	upgrade := mutationResults[0]
+	if mutationErrors[0] != nil || upgrade == nil {
+		t.Fatalf("first concurrent wallet upgrade request failed: result=%+v err=%v", upgrade, mutationErrors[0])
+	}
+	for i := range mutationResults {
+		if mutationErrors[i] != nil || mutationResults[i] == nil || mutationResults[i].OrderID != upgrade.OrderID || mutationResults[i].SubscriptionID != initial.SubscriptionID {
+			t.Fatalf("concurrent wallet upgrade replay had multiple effects: first=%+v result=%+v err=%v", upgrade, mutationResults[i], mutationErrors[i])
+		}
+	}
+	if _, err = s.CreateSubscriptionMutation(ctx, customer, initial.SubscriptionID, deviceQuote.ID, "direct", "mutation-device-payment"); !errors.Is(err, store.ErrConflict) {
+		t.Fatalf("an idempotency key reused with different payment input was accepted: %v", err)
+	}
+	panel.updateOutcome = xui.Unknown // The worker must verify the applied full-row update.
+	if err = runner.ProcessOne(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if panel.updateCalls != 1 || panel.remote.Comment != xui.CustomerClientComment("mutation-plan", customer.TelegramID, 2) || panel.lastUpdate.LimitIP != 0 || panel.remote.LimitIP != 0 || panel.lastUpdate.TotalGB != commerce.GiB || panel.remote.TrafficLimit() != commerce.GiB {
+		t.Fatalf("device upgrade did not change only the fake cap marker: calls=%d remote=%+v", panel.updateCalls, panel.remote)
+	}
+	if string(panel.lastUpdate.Extra["password"]) != `"panel-password"` || string(panel.lastUpdate.Extra["privateKey"]) != `"panel-private-key"` {
+		t.Fatalf("full-row update dropped unowned panel secrets: %+v", panel.lastUpdate.Extra)
+	}
+	var status string
+	var devices int
+	var expiry int64
+	if err = s.DB.QueryRow(ctx, `SELECT status,ip_limit,expiry_time_ms FROM subscriptions WHERE id=$1`, initial.SubscriptionID).Scan(&status, &devices, &expiry); err != nil {
+		t.Fatal(err)
+	}
+	if status != "active" || devices != 2 || expiry != originalExpiry {
+		t.Fatalf("verified device upgrade database state=%s/%d/%d; want active/2/%d", status, devices, expiry, originalExpiry)
+	}
+	var balance int64
+	if err = s.DB.QueryRow(ctx, `SELECT wallet_balance_toman FROM commercial_accounts WHERE id=$1`, customer.AccountID).Scan(&balance); err != nil {
+		t.Fatal(err)
+	}
+	if balance != 100000-initialQuote.FinalPriceToman-deviceQuote.FinalPriceToman {
+		t.Fatalf("wallet balance after idempotent service upgrade = %d", balance)
+	}
+
+	renewQuote, err := s.CreateSubscriptionMutationQuote(ctx, customer, initial.SubscriptionID, "extend", 1, 2, "mutation-renewal-quote")
+	if err != nil {
+		t.Fatal(err)
+	}
+	renewal, err := s.CreateSubscriptionMutation(ctx, customer, initial.SubscriptionID, renewQuote.ID, "direct", "mutation-renewal-payment")
+	if err != nil || renewal.Status != "awaiting_payment" || panel.updateCalls != 1 {
+		t.Fatalf("direct renewal did not wait for review: result=%+v updates=%d err=%v", renewal, panel.updateCalls, err)
+	}
+	renewalReplay, err := s.CreateSubscriptionMutation(ctx, customer, initial.SubscriptionID, renewQuote.ID, "direct", "mutation-renewal-payment")
+	if err != nil || renewalReplay.OrderID != renewal.OrderID || renewalReplay.PaymentIntentID != renewal.PaymentIntentID {
+		t.Fatalf("direct renewal replay created a second payment intent: first=%+v replay=%+v err=%v", renewal, renewalReplay, err)
+	}
+	if err = s.SubmitReceipt(ctx, customer, renewal.PaymentIntentID, "telegram-receipt"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = s.ApprovePayment(ctx, admin, renewal.PaymentIntentID); err != nil {
+		t.Fatal(err)
+	}
+	if err = runner.ProcessOne(ctx); err != nil {
+		t.Fatal(err)
+	}
+	var finalExpiry int64
+	if err = s.DB.QueryRow(ctx, `SELECT status,ip_limit,expiry_time_ms FROM subscriptions WHERE id=$1`, initial.SubscriptionID).Scan(&status, &devices, &finalExpiry); err != nil {
+		t.Fatal(err)
+	}
+	if status != "active" || devices != 2 || finalExpiry != originalExpiry-30*24*60*60*1000 || panel.remote.ExpiryTime != finalExpiry || panel.remote.LimitIP != 0 {
+		t.Fatalf("verified direct renewal state status=%s devices=%d expiry=%d remote=%+v", status, devices, finalExpiry, panel.remote)
+	}
+
+	// An IP-upgrade receipt can sit for review after the subscription expires.
+	// Approval must not apply that stale quote just because the DB status has not
+	// yet been refreshed by another process.
+	shortExpiry := time.Now().UTC().Add(2 * time.Second).UnixMilli()
+	if _, err = s.DB.Exec(ctx, `UPDATE subscriptions SET expiry_time_ms=$2 WHERE id=$1`, initial.SubscriptionID, shortExpiry); err != nil {
+		t.Fatal(err)
+	}
+	lateUpgradeQuote, err := s.CreateSubscriptionMutationQuote(ctx, customer, initial.SubscriptionID, "upgrade_ip", 0, 3, "mutation-late-upgrade-quote")
+	if err != nil {
+		t.Fatal(err)
+	}
+	lateUpgrade, err := s.CreateSubscriptionMutation(ctx, customer, initial.SubscriptionID, lateUpgradeQuote.ID, "direct", "mutation-late-upgrade-payment")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = s.SubmitReceipt(ctx, customer, lateUpgrade.PaymentIntentID, "telegram-late-receipt"); err != nil {
+		t.Fatal(err)
+	}
+	if wait := time.Until(time.UnixMilli(shortExpiry).Add(25 * time.Millisecond)); wait > 0 {
+		time.Sleep(wait)
+	}
+	if _, err = s.ApprovePayment(ctx, admin, lateUpgrade.PaymentIntentID); !errors.Is(err, store.ErrConflict) {
+		t.Fatalf("expired service upgrade was approved from a stale receipt: %v", err)
 	}
 }
 

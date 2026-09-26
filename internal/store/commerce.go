@@ -17,21 +17,24 @@ import (
 var cleanDisplayName = regexp.MustCompile(`[^A-Za-z0-9-]+`)
 
 type provisionData struct {
-	Email             string `json:"email"`
-	UUID              string `json:"uuid"`
-	SubID             string `json:"sub_id"`
-	DisplayName       string `json:"display_name"`
-	PlanName          string `json:"plan_name"`
-	Months            int    `json:"months"`
-	IPLimit           int    `json:"ip_limit"`
-	TrafficLimitBytes int64  `json:"traffic_limit_bytes"`
-	ExpiryTimeMS      int64  `json:"expiry_time_ms"`
-	Flow              string `json:"flow"`
-	InboundIDs        []int  `json:"inbound_ids"`
-	TelegramID        int64  `json:"telegram_id"`
-	ClientUUID        string `json:"client_uuid"`
-	PanelID           string `json:"panel_id"`
-	OperationKey      string `json:"operation_key"`
+	Email                string `json:"email"`
+	UUID                 string `json:"uuid"`
+	SubID                string `json:"sub_id"`
+	DisplayName          string `json:"display_name"`
+	PlanName             string `json:"plan_name"`
+	Months               int    `json:"months"`
+	IPLimit              int    `json:"ip_limit"`
+	TrafficLimitBytes    int64  `json:"traffic_limit_bytes"`
+	ExpiryTimeMS         int64  `json:"expiry_time_ms"`
+	Flow                 string `json:"flow"`
+	InboundIDs           []int  `json:"inbound_ids"`
+	TelegramID           int64  `json:"telegram_id"`
+	ClientUUID           string `json:"client_uuid"`
+	PanelID              string `json:"panel_id"`
+	OperationKey         string `json:"operation_key"`
+	MutationAction       string `json:"mutation_action,omitempty"`
+	ExpectedIPLimit      int    `json:"expected_ip_limit,omitempty"`
+	ExpectedExpiryTimeMS int64  `json:"expected_expiry_time_ms,omitempty"`
 }
 
 func (s *Store) Balance(ctx context.Context, a *Actor) (int64, error) {
@@ -352,16 +355,57 @@ func (s *Store) ApprovePayment(ctx context.Context, a *Actor, intentID int64) (*
 		return nil, ErrConflict
 	}
 	var snapshot struct {
-		Quote     commerce.Quote `json:"quote"`
-		Plan      commerce.Plan  `json:"plan"`
-		Provision provisionData  `json:"provisioning"`
+		Action               string         `json:"action"`
+		SubscriptionID       int64          `json:"subscription_id"`
+		ExpectedStatus       string         `json:"expected_status"`
+		ExpectedIPLimit      int            `json:"expected_ip_limit"`
+		ExpectedExpiryTimeMS int64          `json:"expected_expiry_time_ms"`
+		Quote                commerce.Quote `json:"quote"`
+		Plan                 commerce.Plan  `json:"plan"`
+		Provision            provisionData  `json:"provisioning"`
 	}
 	if err = json.Unmarshal(termsRaw, &snapshot); err != nil {
 		return nil, err
 	}
 	customer := &Actor{ID: customerActor, DeploymentID: a.DeploymentID, AccountID: accountID}
-	if len(snapshot.Plan.InboundIDs) == 0 || snapshot.Provision.Email == "" {
+	if snapshot.Provision.Email == "" {
 		return nil, fmt.Errorf("payment snapshot lacks provisioning data")
+	}
+	if snapshot.Action == "" && len(snapshot.Plan.InboundIDs) == 0 {
+		return nil, fmt.Errorf("payment snapshot lacks provisioning inbounds")
+	}
+	if snapshot.Action != "" {
+		if (snapshot.Action != "extend" && snapshot.Action != "upgrade_ip") || snapshot.SubscriptionID <= 0 ||
+			snapshot.Provision.MutationAction != snapshot.Action || snapshot.Quote.FinalPriceToman != amount {
+			return nil, fmt.Errorf("payment snapshot has unsupported subscription mutation")
+		}
+		var currentStatus string
+		var currentIP int
+		var currentExpiry int64
+		err = tx.QueryRow(ctx, `SELECT status,ip_limit,expiry_time_ms FROM subscriptions WHERE id=$1 AND deployment_id=$2 AND account_id=$3 FOR UPDATE`,
+			snapshot.SubscriptionID, a.DeploymentID, accountID).Scan(&currentStatus, &currentIP, &currentExpiry)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		if err != nil {
+			return nil, err
+		}
+		if currentStatus != snapshot.ExpectedStatus || currentIP != snapshot.ExpectedIPLimit || currentExpiry != snapshot.ExpectedExpiryTimeMS {
+			return nil, ErrConflict
+		}
+		if snapshot.Action == "upgrade_ip" && (currentStatus != "active" || currentExpiry == 0 ||
+			(currentExpiry > 0 && currentExpiry <= time.Now().UTC().UnixMilli()) || snapshot.Provision.IPLimit <= currentIP) {
+			return nil, ErrConflict
+		}
+		if snapshot.Action == "extend" && (snapshot.Provision.Months < 1 || snapshot.Provision.Months > 120 || snapshot.Provision.IPLimit != currentIP) {
+			return nil, ErrConflict
+		}
+		if snapshot.Action == "extend" {
+			snapshot.Provision.ExpiryTimeMS, err = extendedExpiry(currentExpiry, snapshot.Provision.Months, time.Now().UTC())
+			if err != nil {
+				return nil, err
+			}
+		}
 	}
 	if _, err = tx.Exec(ctx, `INSERT INTO payment_settlements(deployment_id,account_id,intent_id,amount_toman,status,approved_by,operation_key)
 		VALUES($1,$2,$3,$4,'approved',$5,$6) ON CONFLICT(intent_id) DO NOTHING`, a.DeploymentID, accountID, intentID, amount, a.ID, "payment-approval:"+intentKey); err != nil {
@@ -373,11 +417,20 @@ func (s *Store) ApprovePayment(ctx context.Context, a *Actor, intentID int64) (*
 	if _, err = tx.Exec(ctx, `UPDATE orders SET status='provisioning',updated_at=now() WHERE id=$1`, orderID); err != nil {
 		return nil, err
 	}
-	_, workID, err := createProvisionWork(ctx, tx, customer, snapshot.Plan, snapshot.Provision, "purchase:"+intentKey, hashJSON(snapshot), "paid", &intentID)
-	if err != nil {
-		return nil, err
+	if snapshot.Action != "" {
+		if _, err = tx.Exec(ctx, `UPDATE subscriptions SET status='provisioning',updated_at=now() WHERE id=$1 AND status=$2`, snapshot.SubscriptionID, snapshot.ExpectedStatus); err != nil {
+			return nil, err
+		}
+		if err = createSubscriptionMutationWork(ctx, tx, customer, snapshot.Provision.PanelID, snapshot.SubscriptionID, intentKey, hashJSON(snapshot), snapshot.Provision, &intentID); err != nil {
+			return nil, err
+		}
+	} else {
+		_, workID, workErr := createProvisionWork(ctx, tx, customer, snapshot.Plan, snapshot.Provision, "purchase:"+intentKey, hashJSON(snapshot), "paid", &intentID)
+		if workErr != nil {
+			return nil, workErr
+		}
+		_ = workID
 	}
-	_ = workID
 	if err = tx.Commit(ctx); err != nil {
 		return nil, err
 	}

@@ -1,10 +1,15 @@
 package worker
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"log/slog"
 	"slices"
+	"strings"
 	"time"
 
 	"example.com/xui-commerce/backend/internal/config"
@@ -103,10 +108,166 @@ func (r *Runner) ProcessOne(ctx context.Context) error {
 	if w.Kind == "subscription_delete" {
 		return r.processDelete(ctx, panel, w)
 	}
+	if w.Kind == "subscription_update" {
+		return r.processSubscriptionUpdate(ctx, panel, w)
+	}
 	if w.Kind != "provision_add" {
 		return r.Store.ManualReviewWork(ctx, w.ID, "unsupported durable work kind", map[string]any{"kind": w.Kind})
 	}
 	return r.processProvision(ctx, panel, w)
+}
+
+type clientUpdater interface {
+	Update(context.Context, string, xui.ClientConfig) xui.WriteResult
+}
+
+func (r *Runner) processSubscriptionUpdate(ctx context.Context, p Panel, w *store.WorkItem) error {
+	if w.Desired.MutationAction != "extend" && w.Desired.MutationAction != "upgrade_ip" {
+		return r.Store.ManualReviewWork(ctx, w.ID, "unsupported subscription update action", map[string]any{"action": w.Desired.MutationAction})
+	}
+	remote, err := p.GetClient(ctx, w.Desired.Email)
+	if errors.Is(err, xui.ErrNotFound) {
+		return r.Store.ManualReviewWork(ctx, w.ID, "existing panel client is absent; refusing to recreate it during an update", map[string]any{"email": w.Desired.Email})
+	}
+	if err != nil {
+		if w.Attempts < 5 {
+			return r.Store.RetryWork(ctx, w.ID, "panel client read failed before update: "+err.Error(), true)
+		}
+		return r.Store.ManualReviewWork(ctx, w.ID, "cannot verify panel client before update", map[string]any{"error": err.Error()})
+	}
+	if !matchesUpdateIdentity(w, remote) {
+		return r.Store.ManualReviewWork(ctx, w.ID, "panel client identity does not match the owned subscription", map[string]any{"email": remoteEmail(remote), "uuid": xui.UUIDOf(remote), "sub_id": remoteSub(remote)})
+	}
+	devices, err := xui.CustomerDeviceLimit(remote.Comment)
+	if err != nil || (devices != w.Desired.ExpectedIPLimit && devices != w.Desired.IPLimit) {
+		return r.Store.ManualReviewWork(ctx, w.ID, "panel device marker does not match the recorded subscription limit", map[string]any{"email": remote.Email, "expected_devices": w.Desired.ExpectedIPLimit})
+	}
+	preservedFingerprint, fingerprintErr := preservedClientFingerprint(remote)
+	if fingerprintErr != nil {
+		return r.Store.ManualReviewWork(ctx, w.ID, "panel client contains fields that cannot be safely fingerprinted", map[string]any{"email": remote.Email})
+	}
+	if updateStateMatches(w, remote) {
+		if w.Phase != "ready" {
+			return r.Store.ManualReviewWork(ctx, w.ID, "panel reached the requested update state after a prior attempt; full-row preservation cannot be proven after restart", map[string]any{"email": remote.Email})
+		}
+		return r.Store.SucceedWork(ctx, w, nil)
+	}
+	if devices != w.Desired.ExpectedIPLimit {
+		return r.Store.ManualReviewWork(ctx, w.ID, "panel device marker reached a partial or conflicting update state", map[string]any{"email": remote.Email, "observed_devices": devices, "expected_devices": w.Desired.ExpectedIPLimit, "desired_devices": w.Desired.IPLimit})
+	}
+	if remote.ExpiryTime != w.Desired.ExpectedExpiryTimeMS {
+		return r.Store.ManualReviewWork(ctx, w.ID, "panel expiry changed outside the requested update", map[string]any{"email": remote.Email, "expected_expiry_time_ms": w.Desired.ExpectedExpiryTimeMS, "observed_expiry_time_ms": remote.ExpiryTime})
+	}
+	if w.Phase != "ready" {
+		return r.Store.ManualReviewWork(ctx, w.ID, "previous full-row update attempt is still at the prior client state; refusing to issue it again", map[string]any{"email": remote.Email, "phase": w.Phase})
+	}
+	if w.Desired.MutationAction == "upgrade_ip" && w.Desired.IPLimit != w.Desired.ExpectedIPLimit {
+		updatedComment, commentErr := xui.UpdateCustomerDeviceComment(remote.Comment, w.Desired.IPLimit)
+		if commentErr != nil {
+			return r.Store.ManualReviewWork(ctx, w.ID, "panel device marker cannot be updated safely", map[string]any{"email": remote.Email})
+		}
+		remote.Comment = updatedComment
+	}
+	updater, ok := p.(clientUpdater)
+	if !ok {
+		return r.Store.ManualReviewWork(ctx, w.ID, "panel adapter does not support full-row client updates", map[string]any{"email": remote.Email})
+	}
+	id := remote.UUID
+	if id == "" && len(remote.ID) > 0 {
+		id = strings.Trim(string(remote.ID), `"`)
+	}
+	config := xui.ClientConfig{
+		ID: id, Email: remote.Email, SubID: remote.SubID, Enable: remote.Enable,
+		ExpiryTime: w.Desired.ExpiryTimeMS, LimitIP: 0, LimitHWID: remote.LimitHWID,
+		TotalGB: remote.TrafficLimit(), Flow: remote.Flow, Group: remote.Group, Comment: remote.Comment,
+		TgID: remote.TgID, Extra: remote.Extra,
+	}
+	if err := r.Store.MarkCreateAttempted(ctx, w.ID); err != nil {
+		return err
+	}
+	write := updater.Update(ctx, remote.Email, config)
+	observed, readErr := p.GetClient(ctx, w.Desired.Email)
+	if errors.Is(readErr, xui.ErrNotFound) {
+		return r.Store.ManualReviewWork(ctx, w.ID, "panel client disappeared during update", map[string]any{"email": w.Desired.Email, "write_outcome": write.Outcome})
+	}
+	if readErr != nil {
+		if w.Attempts < 5 {
+			return r.Store.RetryWork(ctx, w.ID, "panel readback failed after update: "+readErr.Error(), false)
+		}
+		return r.Store.ManualReviewWork(ctx, w.ID, "cannot read back panel client after update", map[string]any{"email": w.Desired.Email, "write_outcome": write.Outcome})
+	}
+	if !matchesUpdateIdentity(w, observed) {
+		return r.Store.ManualReviewWork(ctx, w.ID, "panel client identity changed during update", map[string]any{"email": remoteEmail(observed), "uuid": xui.UUIDOf(observed), "sub_id": remoteSub(observed)})
+	}
+	if updateStateMatches(w, observed) {
+		observedFingerprint, verifyErr := preservedClientFingerprint(observed)
+		if verifyErr != nil || observedFingerprint != preservedFingerprint {
+			return r.Store.ManualReviewWork(ctx, w.ID, "full-row update changed panel-owned client fields; service requires manual review", map[string]any{"email": observed.Email, "write_outcome": write.Outcome})
+		}
+		return r.Store.SucceedWork(ctx, w, nil)
+	}
+	observedDevices, markerErr := xui.CustomerDeviceLimit(observed.Comment)
+	if observed.ExpiryTime == w.Desired.ExpectedExpiryTimeMS && markerErr == nil && observedDevices == w.Desired.ExpectedIPLimit {
+		observedFingerprint, verifyErr := preservedClientFingerprint(observed)
+		if verifyErr != nil || observedFingerprint != preservedFingerprint {
+			return r.Store.ManualReviewWork(ctx, w.ID, "panel-owned client fields changed while checking the update result", map[string]any{"email": observed.Email, "write_outcome": write.Outcome})
+		}
+		if write.Outcome == xui.DefinitiveNoWrite && w.Attempts < 5 {
+			return r.Store.RetryWork(ctx, w.ID, "panel update was read back at its prior state; safe to reapply after verification", true)
+		}
+		return r.Store.ManualReviewWork(ctx, w.ID, "panel update outcome is unresolved at its prior client state; refusing to repeat a possibly partial full-row update", map[string]any{"email": observed.Email, "write_outcome": write.Outcome})
+	}
+	return r.Store.ManualReviewWork(ctx, w.ID, "panel client has a partial or conflicting update state", map[string]any{"email": observed.Email, "observed_expiry_time_ms": observed.ExpiryTime, "expected_expiry_time_ms": w.Desired.ExpectedExpiryTimeMS})
+}
+
+func matchesUpdateIdentity(w *store.WorkItem, remote *xui.RemoteClient) bool {
+	return w != nil && remote != nil && remote.Email == w.Desired.Email && xui.UUIDOf(remote) == w.Desired.UUID && remoteSub(remote) == w.Desired.SubID
+}
+
+func preservedClientFingerprint(remote *xui.RemoteClient) (string, error) {
+	if remote == nil {
+		return "", errors.New("panel client is required")
+	}
+	extra := make(map[string]any, len(remote.Extra))
+	for key, raw := range remote.Extra {
+		decoder := json.NewDecoder(bytes.NewReader(raw))
+		decoder.UseNumber()
+		var value any
+		if err := decoder.Decode(&value); err != nil {
+			return "", err
+		}
+		extra[key] = value
+	}
+	fields := struct {
+		ID        string         `json:"id"`
+		Email     string         `json:"email"`
+		SubID     string         `json:"sub_id"`
+		Enable    bool           `json:"enable"`
+		LimitHWID int            `json:"limit_hwid"`
+		TotalGB   int64          `json:"total_gb"`
+		Flow      string         `json:"flow"`
+		Group     string         `json:"group"`
+		TgID      int64          `json:"tg_id"`
+		Extra     map[string]any `json:"extra"`
+	}{
+		ID: xui.UUIDOf(remote), Email: remote.Email, SubID: remote.SubID, Enable: remote.Enable,
+		LimitHWID: remote.LimitHWID, TotalGB: remote.TrafficLimit(),
+		Flow: remote.Flow, Group: remote.Group, TgID: remote.TgID, Extra: extra,
+	}
+	data, err := json.Marshal(fields)
+	if err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:]), nil
+}
+
+func updateStateMatches(w *store.WorkItem, remote *xui.RemoteClient) bool {
+	if w == nil || remote == nil || remote.ExpiryTime != w.Desired.ExpiryTimeMS || remote.LimitIP != 0 {
+		return false
+	}
+	devices, err := xui.CustomerDeviceLimit(remote.Comment)
+	return err == nil && devices == w.Desired.IPLimit
 }
 
 func (r *Runner) processProvision(ctx context.Context, p Panel, w *store.WorkItem) error {
@@ -121,7 +282,8 @@ func (r *Runner) processProvision(ctx context.Context, p Panel, w *store.WorkIte
 		if err = r.Store.MarkCreateAttempted(ctx, w.ID); err != nil {
 			return err
 		}
-		result := p.Add(ctx, xui.ClientConfig{ID: w.Desired.ClientUUID, Email: w.Desired.Email, SubID: w.Desired.SubID, Enable: true, ExpiryTime: w.Desired.ExpiryTimeMS, LimitIP: w.Desired.IPLimit, LimitHWID: 0, TotalGB: w.Desired.TrafficLimitBytes, Flow: w.Desired.Flow, Comment: w.Desired.PlanName, TgID: w.Desired.TelegramID}, w.Desired.InboundIDs)
+		comment := xui.CustomerClientComment(w.Desired.PlanName, w.Desired.TelegramID, w.Desired.IPLimit)
+		result := p.Add(ctx, xui.ClientConfig{ID: w.Desired.ClientUUID, Email: w.Desired.Email, SubID: w.Desired.SubID, Enable: true, ExpiryTime: w.Desired.ExpiryTimeMS, LimitIP: 0, LimitHWID: 0, TotalGB: w.Desired.TrafficLimitBytes, Flow: w.Desired.Flow, Comment: comment, TgID: w.Desired.TelegramID}, w.Desired.InboundIDs)
 		if result.Outcome == xui.DefinitiveNoWrite {
 			reason := "panel confirmed no write"
 			if result.Err != nil {
@@ -152,7 +314,7 @@ func (r *Runner) processProvision(ctx context.Context, p Panel, w *store.WorkIte
 }
 
 func (r *Runner) verifyProvision(ctx context.Context, p Panel, w *store.WorkItem, remote *xui.RemoteClient) error {
-	if !sameCore(w, remote) || remote.Enable != true || remote.ExpiryTime != w.Desired.ExpiryTimeMS || remote.LimitIP != w.Desired.IPLimit || remote.TrafficLimit() != w.Desired.TrafficLimitBytes {
+	if !matchesProvisionFields(w, remote) {
 		return r.Store.ManualReviewWork(ctx, w.ID, "panel client does not match the persisted identity and desired state", map[string]any{"email": remoteEmail(remote), "uuid": xui.UUIDOf(remote), "sub_id": remoteSub(remote), "inbounds": remoteInbounds(remote)})
 	}
 	desired := unique(w.Desired.InboundIDs)
@@ -190,6 +352,20 @@ func (r *Runner) verifyProvision(ctx context.Context, p Panel, w *store.WorkItem
 		links = []string{}
 	}
 	return r.Store.SucceedWork(ctx, w, links)
+}
+
+func matchesProvisionFields(w *store.WorkItem, remote *xui.RemoteClient) bool {
+	if w == nil || remote == nil || !sameCore(w, remote) || !remote.Enable || remote.ExpiryTime != w.Desired.ExpiryTimeMS || remote.TrafficLimit() != w.Desired.TrafficLimitBytes {
+		return false
+	}
+	modernComment := xui.CustomerClientComment(w.Desired.PlanName, w.Desired.TelegramID, w.Desired.IPLimit)
+	if remote.LimitIP == 0 && remote.Comment == modernComment {
+		return true
+	}
+	// Work created before comment-based device limits were introduced can still
+	// finish safely when its original panel state matches the old desired values.
+	// This keeps an already-attempted provision out of manual review during rollout.
+	return remote.LimitIP == w.Desired.IPLimit && remote.Comment == w.Desired.PlanName
 }
 
 func sameCore(w *store.WorkItem, remote *xui.RemoteClient) bool {

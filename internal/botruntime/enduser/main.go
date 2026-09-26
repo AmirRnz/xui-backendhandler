@@ -64,6 +64,11 @@ type quote struct {
 	DiscountToman        int64  `json:"discount_toman"`
 	Price                int64  `json:"final_price_toman"`
 	Currency             string `json:"currency"`
+	Action               string `json:"action"`
+	SubscriptionID       int64  `json:"subscription_id"`
+	CurrentIPLimit       int    `json:"current_ip_limit"`
+	CurrentExpiryTimeMS  int64  `json:"current_expiry_time_ms"`
+	DesiredExpiryTimeMS  int64  `json:"desired_expiry_time_ms"`
 }
 type purchase struct {
 	OrderID        int64  `json:"order_id"`
@@ -76,6 +81,7 @@ type subscriptionView struct {
 	ID                int64    `json:"id"`
 	Email             string   `json:"email"`
 	DisplayName       string   `json:"display_name"`
+	PlanID            int64    `json:"plan_id"`
 	Status            string   `json:"status"`
 	Kind              string   `json:"kind"`
 	IPLimit           int      `json:"ip_limit"`
@@ -141,6 +147,8 @@ type conversation struct {
 	Nonce                    string
 	Step                     string
 	PlanID                   int64
+	SubscriptionID           int64
+	MutationAction           string
 	Method                   string
 	Months                   int
 	IPLimit                  int
@@ -157,6 +165,7 @@ type conversation struct {
 	AdminReceiptID           int64
 	AdminPendingKind         string
 	AdminPendingOffset       int
+	DraftInboundPage         int
 	Admin                    string
 	AdminID                  int64
 	PanelURL                 string
@@ -168,26 +177,29 @@ type conversation struct {
 	Updated                  time.Time
 }
 type adminPlan struct {
-	ID                 int64   `json:"id,omitempty"`
-	Name               string  `json:"name"`
-	Kind               string  `json:"kind"`
-	Enabled            bool    `json:"enabled"`
-	IsLimited          bool    `json:"is_limited"`
-	Description        string  `json:"description"`
-	BasePrice          int64   `json:"base_price_toman"`
-	PricePerExtraIP    int64   `json:"price_per_extra_ip_toman"`
-	PricePerGB         int64   `json:"price_per_gb_toman"`
-	PricePerExtraMonth int64   `json:"price_per_extra_month_toman"`
-	BaseIP             int     `json:"base_ip_limit"`
-	MaxIP              int     `json:"max_ip_limit"`
-	MinGB              int     `json:"min_data_gb"`
-	MaxBytes           int64   `json:"max_data_bytes"`
-	ExpireSeconds      int64   `json:"expire_seconds"`
-	TestIPLimit        int     `json:"test_ip_limit"`
-	MaxPerDay          int     `json:"max_per_day"`
-	Flow               string  `json:"flow"`
-	InboundIDs         []int64 `json:"inbound_ids"`
-	UsageDescription   string  `json:"usage_description"`
+	ID                 int64          `json:"id,omitempty"`
+	Name               string         `json:"name"`
+	Kind               string         `json:"kind"`
+	Enabled            bool           `json:"enabled"`
+	IsLimited          bool           `json:"is_limited"`
+	Description        string         `json:"description"`
+	BasePrice          int64          `json:"base_price_toman"`
+	PricePerExtraIP    int64          `json:"price_per_extra_ip_toman"`
+	PricePerGB         int64          `json:"price_per_gb_toman"`
+	PricePerExtraMonth int64          `json:"price_per_extra_month_toman"`
+	BaseIP             int            `json:"base_ip_limit"`
+	MaxIP              int            `json:"max_ip_limit"`
+	MinGB              int            `json:"min_data_gb"`
+	MaxBytes           int64          `json:"max_data_bytes"`
+	ExpireSeconds      int64          `json:"expire_seconds"`
+	TestIPLimit        int            `json:"test_ip_limit"`
+	MaxPerDay          int            `json:"max_per_day"`
+	DiscountTiers      []discountTier `json:"discount_tiers"`
+	Flow               string         `json:"flow"`
+	InboundIDs         []int64        `json:"inbound_ids"`
+	UsageDescription   string         `json:"usage_description"`
+	IsGlobal           bool           `json:"is_global"`
+	AllowedTelegramIDs []int64        `json:"allowed_telegram_ids"`
 }
 type adminConfig struct {
 	DeploymentID        string            `json:"deployment_id"`
@@ -659,6 +671,11 @@ func (a *botApp) callbackFailure(c telebot.Context, action string, st conversati
 		m.Inline(m.Row(m.Data("🔁 همان پرداخت را دوباره بررسی کنید", "nav", st.Nonce, "retry-purchase")), m.Row(m.Data("🏠 خانه", "nav", st.Nonce, "home")))
 		return present(c, "پرداخت تأیید نشد. اگر پاسخ backend نامشخص مانده باشد، تلاش دوباره با همان شناسه فقط یک سفارش ثبت می‌کند.", m, true)
 	}
+	if action == "mutation-pay" && st.QuoteID > 0 {
+		st = a.next(st)
+		a.setState(c.Sender().ID, st)
+		return a.mutationConfirmation(c, st, "پرداخت ثبت نشد. همان درخواست را دوباره بررسی کنید یا روش پرداخت را عوض کنید.", true)
+	}
 	return a.freshHome(c, "درخواست انجام نشد. از منوی تازه دوباره تلاش کنید.")
 }
 func (a *botApp) getFeatures(c telebot.Context) (publicFeatures, error) {
@@ -921,6 +938,69 @@ func (a *botApp) route(c telebot.Context, action string, args []string, st conve
 			return a.services(c, true)
 		}
 		return a.serviceDetail(c, id, true)
+	case "service-extend":
+		if len(args) != 1 {
+			return a.services(c, true)
+		}
+		id, e := strconv.ParseInt(args[0], 10, 64)
+		if e != nil || id <= 0 {
+			return a.services(c, true)
+		}
+		return a.subscriptionExtensionMenu(c, id, true)
+	case "service-extend-custom":
+		if len(args) != 1 {
+			return a.services(c, true)
+		}
+		id, e := strconv.ParseInt(args[0], 10, 64)
+		if e != nil || id <= 0 {
+			return a.services(c, true)
+		}
+		st.SubscriptionID = id
+		st.Step = "service-renew-months"
+		st = a.next(st)
+		a.setState(c.Sender().ID, st)
+		return a.prompt(c, "مدت تمدید را به ماه وارد کنید (۱ تا ۱۲۰).", true)
+	case "service-extend-quote":
+		if len(args) != 2 {
+			return a.services(c, true)
+		}
+		id, e1 := strconv.ParseInt(args[0], 10, 64)
+		months, e2 := strconv.Atoi(args[1])
+		if e1 != nil || e2 != nil || id <= 0 || months < 1 || months > 120 {
+			return a.services(c, true)
+		}
+		key := callbackOperationKey(c, "subscription-extend-quote", fmt.Sprintf("%d:%d", id, months))
+		return a.createSubscriptionMutationQuote(c, st, id, "extend", months, 0, key, true)
+	case "service-upgrade-menu":
+		if len(args) != 1 {
+			return a.services(c, true)
+		}
+		id, e := strconv.ParseInt(args[0], 10, 64)
+		if e != nil || id <= 0 {
+			return a.services(c, true)
+		}
+		return a.subscriptionDeviceUpgradeMenu(c, id, true)
+	case "service-upgrade-quote":
+		if len(args) != 2 {
+			return a.services(c, true)
+		}
+		id, e1 := strconv.ParseInt(args[0], 10, 64)
+		ipLimit, e2 := strconv.Atoi(args[1])
+		if e1 != nil || e2 != nil || id <= 0 || ipLimit <= 0 {
+			return a.services(c, true)
+		}
+		key := callbackOperationKey(c, "subscription-upgrade-quote", fmt.Sprintf("%d:%d", id, ipLimit))
+		return a.createSubscriptionMutationQuote(c, st, id, "upgrade_ip", 0, ipLimit, key, true)
+	case "mutation-pay":
+		if len(args) != 1 || st.QuoteID <= 0 || st.SubscriptionID <= 0 || (args[0] != "wallet" && args[0] != "direct") {
+			return a.services(c, true)
+		}
+		return a.submitSubscriptionMutation(c, st, args[0])
+	case "mutation-cancel":
+		if st.SubscriptionID <= 0 {
+			return a.services(c, true)
+		}
+		return a.serviceDetail(c, st.SubscriptionID, true)
 	case "cancel":
 		if len(args) != 1 {
 			return a.home(c, "درخواست نامعتبر است.", true)
@@ -1037,16 +1117,22 @@ func (a *botApp) route(c telebot.Context, action string, args []string, st conve
 		return a.adminPlans(c, true)
 	case "config-edit-plan", "config-new-plan":
 		if action == "config-new-plan" {
-			st.Admin = "new-plan-name"
-			st = a.next(st)
-			a.setState(c.Sender().ID, st)
-			return a.prompt(c, "نام طرح جدید را ارسال کنید.", true)
+			return a.startPlanDraft(c)
 		}
 		var id int64
 		if len(args) > 0 {
 			id, _ = strconv.ParseInt(args[0], 10, 64)
 		}
 		return a.editPlanPrompt(c, id, true)
+	case "plan-inbounds":
+		if len(args) != 1 {
+			return a.adminPlans(c, true)
+		}
+		id, e := strconv.ParseInt(args[0], 10, 64)
+		if e != nil || id <= 0 {
+			return a.adminPlans(c, true)
+		}
+		return a.editPlanInbounds(c, id)
 	case "pf":
 		if len(args) != 2 {
 			return a.adminPlans(c, true)
@@ -1076,11 +1162,76 @@ func (a *botApp) route(c telebot.Context, action string, args []string, st conve
 		}
 		return a.togglePlan(c, id, field)
 	case "new-plan-kind":
-		if len(args) != 1 || st.Draft == nil || st.Draft.Name == "" || (args[0] != "paid" && args[0] != "test") {
+		if len(args) != 1 {
 			return a.adminPlans(c, true)
 		}
-		st.Draft.Kind = args[0]
-		return a.createPlan(c, st.Draft)
+		return a.choosePlanKind(c, st, args[0])
+	case "draft-back":
+		if st.Draft != nil && st.Draft.ID > 0 {
+			p := *st.Draft
+			st.Draft = nil
+			st.DraftInboundPage = 0
+			st.Admin = ""
+			st = a.next(st)
+			a.setState(c.Sender().ID, st)
+			return a.planEditor(c, p, true)
+		}
+		st.Admin = ""
+		st = a.next(st)
+		a.setState(c.Sender().ID, st)
+		return a.showPlanDraft(c, true)
+	case "draft-field":
+		if len(args) != 1 {
+			return a.showPlanDraft(c, true)
+		}
+		return a.promptDraftField(c, st, args[0])
+	case "draft-toggle-limited":
+		if st.Draft == nil || st.Draft.Kind != "paid" {
+			return a.showPlanDraft(c, true)
+		}
+		st.Draft.IsLimited = !st.Draft.IsLimited
+		return a.savePlanDraftAndShow(c, st, true)
+	case "draft-flow":
+		return a.promptDraftField(c, st, "flow")
+	case "draft-flow-set":
+		if st.Draft == nil || len(args) != 1 {
+			return a.showPlanDraft(c, true)
+		}
+		st.Draft.Flow = args[0]
+		return a.savePlanDraftAndShow(c, st, true)
+	case "draft-inbounds":
+		return a.showDraftInbounds(c, true)
+	case "draft-inbound-toggle":
+		if len(args) != 1 {
+			return a.showDraftInbounds(c, true)
+		}
+		return a.toggleDraftInbound(c, st, args[0])
+	case "draft-inbounds-page":
+		if len(args) != 1 || st.Draft == nil {
+			return a.showDraftInbounds(c, true)
+		}
+		page, e := strconv.Atoi(args[0])
+		if e != nil || page < 0 {
+			return a.showDraftInbounds(c, true)
+		}
+		st.DraftInboundPage = page
+		st = a.next(st)
+		a.setState(c.Sender().ID, st)
+		return a.showDraftInbounds(c, true)
+	case "draft-inbounds-all":
+		return a.setDraftAllInbounds(c, st, true)
+	case "draft-inbounds-clear":
+		return a.setDraftAllInbounds(c, st, false)
+	case "draft-inbounds-done":
+		if st.Draft != nil && st.Draft.ID > 0 {
+			return a.saveExistingPlanInbounds(c, st.Draft)
+		}
+		return a.savePlanDraftAndShow(c, st, true)
+	case "draft-save":
+		return a.savePlanDraft(c)
+	case "draft-cancel":
+		a.resetPlanEditorState(c)
+		return a.adminPlans(c, true)
 	case "config-payment":
 		return a.adminPayment(c, true)
 	case "config-payment-field":
@@ -1474,6 +1625,13 @@ func (a *botApp) text(c telebot.Context) error {
 		}
 		st.Months = n
 		return a.afterPurchaseDuration(c, st, false)
+	case "service-renew-months":
+		months, e := strconv.Atoi(value)
+		if e != nil || months < 1 || months > 120 || st.SubscriptionID <= 0 {
+			return c.Send("مدت تمدید باید عددی بین ۱ تا ۱۲۰ ماه باشد.")
+		}
+		key := stableKey(c.Sender().ID, c.Chat().ID, int64(c.Message().ID), fmt.Sprintf("subscription-extend:%d:%d", st.SubscriptionID, months))
+		return a.createSubscriptionMutationQuote(c, st, st.SubscriptionID, "extend", months, 0, key, false)
 	case "purchase-ip":
 		n, e := strconv.Atoi(value)
 		if e != nil || n < 0 || n > 100 {
@@ -1881,6 +2039,12 @@ func (a *botApp) serviceDetail(c telebot.Context, id int64, edit bool) error {
 			text += fmt.Sprintf("\n\n🔗 لینک اتصال %d:\n%s", i+1, link)
 		}
 	}
+	if sub.Kind == "paid" && (sub.Status == "active" || sub.Status == "expired") {
+		rows = append(rows, m.Row(m.Data("⏳ تمدید سرویس", "nav", st.Nonce, "service-extend", strconv.FormatInt(sub.ID, 10))))
+	}
+	if sub.Kind == "paid" && sub.Status == "active" {
+		rows = append(rows, m.Row(m.Data("📱 ارتقای تعداد دستگاه", "nav", st.Nonce, "service-upgrade-menu", strconv.FormatInt(sub.ID, 10))))
+	}
 	rows = append(rows, m.Row(m.Data("🗑 درخواست لغو سرویس", "nav", st.Nonce, "cancel", strconv.FormatInt(sub.ID, 10))))
 	if sub.Kind == "paid" {
 		rows = append(rows, m.Row(m.Data("💸 درخواست بازپرداخت", "nav", st.Nonce, "refund-request", strconv.FormatInt(sub.ID, 10))))
@@ -1888,6 +2052,216 @@ func (a *botApp) serviceDetail(c telebot.Context, id int64, edit bool) error {
 	rows = append(rows, m.Row(m.Data("« بازگشت", "nav", st.Nonce, "services")))
 	m.Inline(rows...)
 	return present(c, text, m, edit)
+}
+
+func (a *botApp) loadOwnedSubscription(c telebot.Context, id int64) (*subscriptionView, error) {
+	act, err := a.resolve(c)
+	if err != nil {
+		return nil, err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	var items []subscriptionView
+	if err = a.api.Call(ctx, "GET", "/v1/subscriptions", act.TelegramID, nil, &items); err != nil {
+		return nil, err
+	}
+	for i := range items {
+		if items[i].ID == id {
+			return &items[i], nil
+		}
+	}
+	return nil, errors.New("subscription not found")
+}
+
+func (a *botApp) subscriptionExtensionMenu(c telebot.Context, id int64, edit bool) error {
+	sub, err := a.loadOwnedSubscription(c, id)
+	if err != nil || sub.Kind != "paid" || (sub.Status != "active" && sub.Status != "expired") || sub.ExpiryTimeMS == 0 {
+		return a.serviceDetail(c, id, edit)
+	}
+	name := sub.DisplayName
+	if name == "" {
+		name = sub.Email
+	}
+	st := a.state(c.Sender().ID)
+	m := &telebot.ReplyMarkup{}
+	m.Inline(
+		m.Row(m.Data("۱ ماه", "nav", st.Nonce, "service-extend-quote", strconv.FormatInt(id, 10), "1"), m.Data("۳ ماه", "nav", st.Nonce, "service-extend-quote", strconv.FormatInt(id, 10), "3")),
+		m.Row(m.Data("۶ ماه", "nav", st.Nonce, "service-extend-quote", strconv.FormatInt(id, 10), "6"), m.Data("✏️ مدت دلخواه", "nav", st.Nonce, "service-extend-custom", strconv.FormatInt(id, 10))),
+		m.Row(m.Data("« بازگشت", "nav", st.Nonce, "services-view", strconv.FormatInt(id, 10))),
+	)
+	return present(c, fmt.Sprintf("⏳ تمدید سرویس %s\nمدت تمدید را انتخاب کنید. مبلغ دقیق پیش از پرداخت نمایش داده می‌شود.", name), m, edit)
+}
+
+func (a *botApp) subscriptionDeviceUpgradeMenu(c telebot.Context, id int64, edit bool) error {
+	sub, err := a.loadOwnedSubscription(c, id)
+	if err != nil || sub.Kind != "paid" || sub.Status != "active" || sub.PlanID <= 0 {
+		return a.serviceDetail(c, id, edit)
+	}
+	act, err := a.resolve(c)
+	if err != nil {
+		return sendFailure(c, err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	var plans []plan
+	if err = a.api.Call(ctx, "GET", "/v1/plans?kind=paid", act.TelegramID, nil, &plans); err != nil {
+		return sendFailure(c, err)
+	}
+	var selected *plan
+	for i := range plans {
+		if plans[i].ID == sub.PlanID {
+			selected = &plans[i]
+			break
+		}
+	}
+	if selected == nil || selected.MaxIP <= sub.IPLimit || sub.IPLimit <= 0 {
+		return present(c, "برای این سرویس دستگاه اضافه‌ای در محدوده طرح موجود نیست.", &telebot.ReplyMarkup{}, edit)
+	}
+	st := a.state(c.Sender().ID)
+	m := &telebot.ReplyMarkup{}
+	rows := make([]telebot.Row, 0, 12)
+	end := selected.MaxIP
+	if end > sub.IPLimit+8 {
+		end = sub.IPLimit + 8
+	}
+	for devices := sub.IPLimit + 1; devices <= end; devices++ {
+		rows = append(rows, m.Row(m.Data(fmt.Sprintf("%d دستگاه", devices), "nav", st.Nonce, "service-upgrade-quote", strconv.FormatInt(id, 10), strconv.Itoa(devices))))
+	}
+	if end < selected.MaxIP {
+		rows = append(rows, m.Row(m.Data(fmt.Sprintf("حداکثر %d دستگاه", selected.MaxIP), "nav", st.Nonce, "service-upgrade-quote", strconv.FormatInt(id, 10), strconv.Itoa(selected.MaxIP))))
+	}
+	rows = append(rows, m.Row(m.Data("« بازگشت", "nav", st.Nonce, "services-view", strconv.FormatInt(id, 10))))
+	m.Inline(rows...)
+	return present(c, fmt.Sprintf("📱 ارتقای سقف دستگاه برای %s\nسقف فعلی: %d\nطرح اجازه تا %d دستگاه را می‌دهد.\nمبلغ تا زمان انقضای سرویس محاسبه می‌شود.", sub.DisplayName, sub.IPLimit, selected.MaxIP), m, edit)
+}
+
+func (a *botApp) createSubscriptionMutationQuote(c telebot.Context, st conversation, id int64, action string, months, ipLimit int, key string, edit bool) error {
+	sub, err := a.loadOwnedSubscription(c, id)
+	if err != nil || sub.Kind != "paid" {
+		return a.services(c, edit)
+	}
+	if action == "extend" {
+		ipLimit = sub.IPLimit
+	}
+	act, err := a.resolve(c)
+	if err != nil {
+		return sendFailure(c, err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	var q quote
+	body := map[string]any{"action": action, "months": months, "ip_limit": ipLimit, "idempotency_key": key}
+	path := fmt.Sprintf("/v1/subscriptions/%d/quotes", id)
+	if err = a.api.Call(ctx, "POST", path, act.TelegramID, body, &q); err != nil {
+		return sendFailure(c, err)
+	}
+	st.SubscriptionID = id
+	st.MutationAction = action
+	st.Months = months
+	st.IPLimit = ipLimit
+	st.OperationKey = key
+	st.QuoteID = q.ID
+	st.QuotePrice = q.Price
+	st.Step = "mutation-payment"
+	st = a.next(st)
+	a.setState(c.Sender().ID, st)
+	return a.mutationConfirmation(c, st, "", edit)
+}
+
+func (a *botApp) mutationConfirmation(c telebot.Context, st conversation, notice string, edit bool) error {
+	features, err := a.getFeatures(c)
+	if err != nil {
+		return sendFailure(c, err)
+	}
+	balance := "0"
+	if featureEnabled(features, "wallet_enabled") {
+		act, resolveErr := a.resolve(c)
+		if resolveErr != nil {
+			return sendFailure(c, resolveErr)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		var wallet map[string]any
+		err = a.api.Call(ctx, "GET", "/v1/wallet", act.TelegramID, nil, &wallet)
+		cancel()
+		if err != nil {
+			return sendFailure(c, err)
+		}
+		balance = formatToman(wallet["balance_toman"])
+	}
+	name := "سرویس"
+	if sub, loadErr := a.loadOwnedSubscription(c, st.SubscriptionID); loadErr == nil {
+		name = sub.DisplayName
+		if name == "" {
+			name = sub.Email
+		}
+	}
+	detail := fmt.Sprintf("سرویس: %s\nمبلغ: %s تومان", name, formatToman(st.QuotePrice))
+	if st.MutationAction == "extend" {
+		detail = fmt.Sprintf("تمدید %d ماهه سرویس %s\nمبلغ: %s تومان", st.Months, name, formatToman(st.QuotePrice))
+	} else if st.MutationAction == "upgrade_ip" {
+		detail = fmt.Sprintf("ارتقا به %d دستگاه برای سرویس %s\nمبلغ تا پایان دوره: %s تومان", st.IPLimit, name, formatToman(st.QuotePrice))
+	}
+	if notice != "" {
+		detail = notice + "\n\n" + detail
+	}
+	m := &telebot.ReplyMarkup{}
+	st = a.state(c.Sender().ID)
+	rows := make([]telebot.Row, 0, 3)
+	if featureEnabled(features, "wallet_enabled") {
+		rows = append(rows, m.Row(m.Data("👛 پرداخت از کیف پول", "nav", st.Nonce, "mutation-pay", "wallet")))
+		detail += fmt.Sprintf("\nموجودی کیف پول: %s تومان", balance)
+	}
+	if featureEnabled(features, "direct_payments_enabled") {
+		rows = append(rows, m.Row(m.Data("💳 پرداخت مستقیم", "nav", st.Nonce, "mutation-pay", "direct")))
+	}
+	rows = append(rows, m.Row(m.Data("❌ انصراف", "nav", st.Nonce, "mutation-cancel")))
+	m.Inline(rows...)
+	return present(c, detail, m, edit)
+}
+
+func (a *botApp) submitSubscriptionMutation(c telebot.Context, st conversation, method string) error {
+	act, err := a.resolve(c)
+	if err != nil {
+		return sendFailure(c, err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	var instructions map[string]any
+	if method == "direct" {
+		if err = a.api.Call(ctx, "GET", "/v1/payment-instructions", act.TelegramID, nil, &instructions); err != nil {
+			return sendFailure(c, err)
+		}
+		if !hasPaymentDestination(instructions) {
+			return a.mutationConfirmation(c, st, "اطلاعات پرداخت مستقیم هنوز توسط مدیریت تنظیم نشده است.", true)
+		}
+	}
+	var out purchase
+	body := map[string]any{"quote_id": st.QuoteID, "payment_method": method, "idempotency_key": st.OperationKey + ":" + method}
+	path := fmt.Sprintf("/v1/subscriptions/%d/mutations", st.SubscriptionID)
+	if err = a.api.Call(ctx, "POST", path, act.TelegramID, body, &out); err != nil {
+		return sendFailure(c, err)
+	}
+	if method == "wallet" {
+		return a.home(c, fmt.Sprintf("درخواست %s با هزینه %s تومان ثبت شد و پس از همگام‌سازی با پنل اعمال می‌شود.", mutationActionName(st.MutationAction), formatToman(out.Amount)), true)
+	}
+	st.Receipt = &receiptState{Kind: "payment", ID: out.IntentID}
+	st.Step = "receipt-photo"
+	st = a.next(st)
+	a.setState(c.Sender().ID, st)
+	m := &telebot.ReplyMarkup{}
+	m.Inline(m.Row(m.Data("📷 ارسال عکس رسید", "nav", st.Nonce, "receipt-payment", strconv.FormatInt(out.IntentID, 10))), m.Row(m.Data("🏠 خانه", "nav", st.Nonce, "home")))
+	return c.Send(fmt.Sprintf("درخواست %s شماره %d\nمبلغ: %s تومان\n\n%s\n\nپس از پرداخت، عکس رسید را ارسال کنید تا پس از بررسی اعمال شود.", mutationActionName(st.MutationAction), out.IntentID, formatToman(out.Amount), formatPaymentInstructions(instructions)), m)
+}
+
+func mutationActionName(action string) string {
+	switch action {
+	case "extend":
+		return "تمدید سرویس"
+	case "upgrade_ip":
+		return "ارتقای تعداد دستگاه"
+	default:
+		return "تغییر سرویس"
+	}
 }
 
 func truncateButton(value string) string {
@@ -2515,11 +2889,8 @@ func (a *botApp) editPlanPrompt(c telebot.Context, id int64, edit bool) error {
 }
 func (a *botApp) planEditor(c telebot.Context, p adminPlan, edit bool) error {
 	st := a.state(c.Sender().ID)
-	m := &telebot.ReplyMarkup{}
-	rows := []telebot.Row{m.Row(m.Data("نام: "+buttonValue(p.Name), "nav", st.Nonce, "pf", strconv.FormatInt(p.ID, 10), planFieldCode("name")), m.Data("نوع: "+buttonValue(p.Kind), "nav", st.Nonce, "pf", strconv.FormatInt(p.ID, 10), planFieldCode("kind"))), m.Row(m.Data(boolLabel("طرح فعال", p.Enabled), "nav", st.Nonce, "pt", strconv.FormatInt(p.ID, 10), "e"), m.Data(boolLabel("حجم محدود", p.IsLimited), "nav", st.Nonce, "pt", strconv.FormatInt(p.ID, 10), "l")), m.Row(m.Data("توضیحات", "nav", st.Nonce, "pf", strconv.FormatInt(p.ID, 10), planFieldCode("description")), m.Data("قیمت پایه تومان: "+numberLabel(p.BasePrice), "nav", st.Nonce, "pf", strconv.FormatInt(p.ID, 10), planFieldCode("base_price_toman"))), m.Row(m.Data("قیمت IP اضافه: "+numberLabel(p.PricePerExtraIP), "nav", st.Nonce, "pf", strconv.FormatInt(p.ID, 10), planFieldCode("price_per_extra_ip_toman")), m.Data("قیمت هر GB: "+numberLabel(p.PricePerGB), "nav", st.Nonce, "pf", strconv.FormatInt(p.ID, 10), planFieldCode("price_per_gb_toman"))), m.Row(m.Data("قیمت ماه اضافه: "+numberLabel(p.PricePerExtraMonth), "nav", st.Nonce, "pf", strconv.FormatInt(p.ID, 10), planFieldCode("price_per_extra_month_toman")), m.Data("IP پایه/حداکثر: "+strconv.Itoa(p.BaseIP)+"/"+strconv.Itoa(p.MaxIP), "nav", st.Nonce, "pf", strconv.FormatInt(p.ID, 10), planFieldCode("ip_limits"))), m.Row(m.Data("حداقل GB: "+strconv.Itoa(p.MinGB), "nav", st.Nonce, "pf", strconv.FormatInt(p.ID, 10), planFieldCode("min_data_gb")), m.Data("حداکثر بایت: "+numberLabel(p.MaxBytes), "nav", st.Nonce, "pf", strconv.FormatInt(p.ID, 10), planFieldCode("max_data_bytes"))), m.Row(m.Data("مدت تست ثانیه: "+numberLabel(p.ExpireSeconds), "nav", st.Nonce, "pf", strconv.FormatInt(p.ID, 10), planFieldCode("expire_seconds")), m.Data("IP تست: "+strconv.Itoa(p.TestIPLimit), "nav", st.Nonce, "pf", strconv.FormatInt(p.ID, 10), planFieldCode("test_ip_limit"))), m.Row(m.Data("جریان: "+buttonValue(p.Flow), "nav", st.Nonce, "pf", strconv.FormatInt(p.ID, 10), planFieldCode("flow"))), m.Row(m.Data("شناسه‌های ورودی پنل", "nav", st.Nonce, "pf", strconv.FormatInt(p.ID, 10), planFieldCode("inbound_ids")), m.Data("راهنمای حجم", "nav", st.Nonce, "pf", strconv.FormatInt(p.ID, 10), planFieldCode("usage_description"))), m.Row(m.Data("↩️ طرح‌ها", "nav", st.Nonce, "config-plans"))}
-	m.Inline(rows...)
-	summary := fmt.Sprintf("تنظیم طرح %s (#%d). مقدار فعلی روی هر گزینه نمایش داده شده است.", p.Name, p.ID)
-	return present(c, summary, m, edit)
+	summary := fmt.Sprintf("تنظیم طرح %s (#%d). گزینه‌ها مقدار فعلی را نشان می‌دهند.", p.Name, p.ID)
+	return present(c, summary, planEditorMarkup(st, p), edit)
 }
 func buttonValue(s string) string {
 	s = strings.TrimSpace(s)
@@ -2572,11 +2943,17 @@ func planFieldCode(field string) string {
 		return "u"
 	case "usage_description":
 		return "v"
+	case "max_per_day":
+		return "q"
+	case "discount_tiers":
+		return "r"
+	case "access":
+		return "a"
 	}
 	return ""
 }
 func planFieldFromCode(code string) (string, bool) {
-	fields := []string{"name", "kind", "description", "base_price_toman", "price_per_extra_ip_toman", "price_per_gb_toman", "price_per_extra_month_toman", "ip_limits", "min_data_gb", "max_data_bytes", "expire_seconds", "test_ip_limit", "flow", "inbound_ids", "usage_description"}
+	fields := []string{"name", "kind", "description", "base_price_toman", "price_per_extra_ip_toman", "price_per_gb_toman", "price_per_extra_month_toman", "ip_limits", "min_data_gb", "max_data_bytes", "expire_seconds", "test_ip_limit", "max_per_day", "flow", "inbound_ids", "usage_description", "discount_tiers", "access"}
 	for _, field := range fields {
 		if planFieldCode(field) == code {
 			return field, true
@@ -2613,6 +2990,10 @@ func planFieldHint(field string) string {
 		return "IP پایه و حداکثر را با ویرگول بفرستید؛ نمونه: ۱,۳."
 	case "inbound_ids":
 		return "شناسه‌های عددی inbound را با ویرگول جدا کنید. فهرست خالی یعنی بدون inbound."
+	case "discount_tiers":
+		return "تخفیف‌ها را به فرمت ماه:درصد وارد کنید، مثل 3:10,6:20؛ برای حذف - بفرستید."
+	case "access":
+		return "شناسه‌های تلگرام را با کاما بفرستید؛ - یعنی دسترسی همگانی. کاربران باید قبلاً این ربات را شروع کرده باشند."
 	case "base_price_toman", "price_per_extra_ip_toman", "price_per_gb_toman", "price_per_extra_month_toman":
 		return "مبلغ را به تومان، به‌صورت عدد صحیح نامنفی بفرستید."
 	case "max_data_bytes":
@@ -2661,6 +3042,10 @@ func planFieldValue(p adminPlan, field string) string {
 		return strings.Join(parts, ",")
 	case "usage_description":
 		return p.UsageDescription
+	case "discount_tiers":
+		return formatDiscountTiers(p.DiscountTiers)
+	case "access":
+		return planAccessLabel(p.IsGlobal, p.AllowedTelegramIDs)
 	}
 	return ""
 }
@@ -2672,6 +3057,26 @@ func (a *botApp) togglePlan(c telebot.Context, id int64, field string) error {
 	for _, p := range cfg.Plans {
 		if p.ID == id {
 			if field == "enabled" {
+				if !p.Enabled {
+					if len(p.InboundIDs) == 0 {
+						return a.editPlanInbounds(c, id)
+					}
+					inbounds, inboundErr := a.panelInbounds(c)
+					if inboundErr != nil {
+						return sendFailure(c, inboundErr)
+					}
+					active := make(map[int64]bool, len(inbounds))
+					for _, inbound := range inbounds {
+						if inbound.Enable {
+							active[int64(inbound.ID)] = true
+						}
+					}
+					for _, inboundID := range p.InboundIDs {
+						if !active[int64(inboundID)] {
+							return a.editPlanInbounds(c, id)
+						}
+					}
+				}
 				p.Enabled = !p.Enabled
 			} else if field == "is_limited" {
 				p.IsLimited = !p.IsLimited
@@ -2731,6 +3136,7 @@ func (a *botApp) resetPlanEditorState(c telebot.Context) {
 	st.Admin = ""
 	st.AdminID = 0
 	st.Draft = nil
+	st.DraftInboundPage = 0
 	a.setState(c.Sender().ID, st)
 }
 func (a *botApp) adminPayment(c telebot.Context, edit bool) error {
@@ -2842,16 +3248,19 @@ func (a *botApp) adminTextInput(c telebot.Context, st conversation, value string
 	var out adminConfig
 	switch {
 	case st.Admin == "new-plan-name":
-		if len([]rune(value)) > 80 {
-			return c.Send("نام طرح حداکثر ۸۰ نویسه باشد.")
+		if strings.TrimSpace(value) == "" || len([]byte(value)) > 120 {
+			return c.Send("نام طرح باید بین ۱ تا ۱۲۰ بایت باشد.")
 		}
-		st.Draft = &adminPlan{Name: value, Enabled: false, BaseIP: 1, MaxIP: 1, InboundIDs: []int64{}}
+		st.Draft = defaultPlanDraft(value, "")
+		st.Admin = ""
 		st = a.next(st)
 		a.setState(c.Sender().ID, st)
 		st = a.state(c.Sender().ID)
 		m := &telebot.ReplyMarkup{}
 		m.Inline(m.Row(m.Data("طرح پولی", "nav", st.Nonce, "new-plan-kind", "paid"), m.Data("طرح تست", "nav", st.Nonce, "new-plan-kind", "test")), m.Row(m.Data("لغو", "nav", st.Nonce, "config-plans")))
-		return c.Send("نوع طرح جدید را انتخاب کنید. طرح ابتدا غیرفعال ساخته می‌شود.", m)
+		return c.Send("نوع طرح جدید را انتخاب کنید. طرح پس از تکمیل این پیش‌نویس ذخیره می‌شود.", m)
+	case strings.HasPrefix(st.Admin, "draft:"):
+		return a.saveDraftText(c, st, value)
 	case st.Admin == "trial-days":
 		days, e := strconv.Atoi(value)
 		if e != nil || days > 3650 {
@@ -2909,8 +3318,8 @@ func (a *botApp) adminTextInput(c telebot.Context, st conversation, value string
 		}
 		switch field {
 		case "name":
-			if len([]rune(value)) > 80 {
-				return c.Send("نام حداکثر ۸۰ نویسه باشد.")
+			if strings.TrimSpace(value) == "" || len([]byte(value)) > 120 {
+				return c.Send("نام باید بین ۱ تا ۱۲۰ بایت باشد.")
 			}
 			p.Name = value
 		case "kind":
@@ -2969,6 +3378,19 @@ func (a *botApp) adminTextInput(c telebot.Context, st conversation, value string
 			p.BaseIP, p.MaxIP = base, max
 		case "flow":
 			p.Flow = value
+		case "discount_tiers":
+			tiers, e := parseDiscountTierText(value)
+			if e != nil {
+				return c.Send("فرمت تخفیف‌ها نامعتبر است: " + e.Error())
+			}
+			p.DiscountTiers = tiers
+		case "access":
+			ids, e := parseTelegramIDList(value)
+			if e != nil {
+				return c.Send("شناسه‌های مجاز نامعتبر است: " + e.Error())
+			}
+			p.AllowedTelegramIDs = ids
+			p.IsGlobal = len(ids) == 0
 		case "inbound_ids":
 			if value == "-" {
 				p.InboundIDs = []int64{}

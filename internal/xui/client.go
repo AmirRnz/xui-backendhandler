@@ -9,6 +9,8 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -51,27 +53,93 @@ type ClientConfig struct {
 	Group      string `json:"group"`
 	Comment    string `json:"comment"`
 	TgID       int64  `json:"tgId"`
+	// Extra carries panel-owned client fields (including authentication secrets)
+	// across full-row updates. It is never persisted or logged by the backend.
+	Extra map[string]json.RawMessage `json:"-"`
 }
 type addRequest struct {
 	Client     ClientConfig `json:"client"`
 	InboundIDs []int        `json:"inboundIds"`
 }
 type RemoteClient struct {
-	ID          json.RawMessage `json:"id"`
-	UUID        string          `json:"uuid"`
-	Email       string          `json:"email"`
-	SubID       string          `json:"subId"`
-	Enable      bool            `json:"enable"`
-	ExpiryTime  int64           `json:"expiryTime"`
-	LimitIP     int             `json:"limitIp"`
-	LimitHWID   int             `json:"limitHwid"`
-	TotalGB     int64           `json:"totalGB"`
-	LegacyTotal int64           `json:"total"`
-	Flow        string          `json:"flow"`
-	Group       string          `json:"group"`
-	Comment     string          `json:"comment"`
-	TgID        int64           `json:"tgId"`
-	InboundIDs  []int           `json:"inboundIds"`
+	ID          json.RawMessage            `json:"id"`
+	UUID        string                     `json:"uuid"`
+	Email       string                     `json:"email"`
+	SubID       string                     `json:"subId"`
+	Enable      bool                       `json:"enable"`
+	ExpiryTime  int64                      `json:"expiryTime"`
+	LimitIP     int                        `json:"limitIp"`
+	LimitHWID   int                        `json:"limitHwid"`
+	TotalGB     int64                      `json:"totalGB"`
+	LegacyTotal int64                      `json:"total"`
+	Flow        string                     `json:"flow"`
+	Group       string                     `json:"group"`
+	Comment     string                     `json:"comment"`
+	TgID        int64                      `json:"tgId"`
+	InboundIDs  []int                      `json:"inboundIds"`
+	Extra       map[string]json.RawMessage `json:"-"`
+}
+
+func (r *RemoteClient) UnmarshalJSON(data []byte) error {
+	type remoteAlias RemoteClient
+	var decoded remoteAlias
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	*r = RemoteClient(decoded)
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil {
+		return err
+	}
+	for _, name := range []string{"id", "uuid", "email", "subId", "enable", "expiryTime", "limitIp", "limitHwid", "totalGB", "total", "flow", "group", "comment", "tgId", "inboundIds"} {
+		delete(fields, name)
+	}
+	r.Extra = fields
+	return nil
+}
+
+func (c ClientConfig) MarshalJSON() ([]byte, error) {
+	type configAlias ClientConfig
+	raw, err := json.Marshal(configAlias(c))
+	if err != nil {
+		return nil, err
+	}
+	fields := make(map[string]json.RawMessage)
+	if err = json.Unmarshal(raw, &fields); err != nil {
+		return nil, err
+	}
+	for key, value := range c.Extra {
+		if _, known := fields[key]; !known {
+			fields[key] = value
+		}
+	}
+	// These fields are part of the full client row. Include zero values too so
+	// a replacement update cannot silently discard a customer's existing value.
+	for key, value := range map[string]any{
+		"id": c.ID, "email": c.Email, "subId": c.SubID, "enable": c.Enable,
+		"expiryTime": c.ExpiryTime, "limitIp": c.LimitIP, "limitHwid": c.LimitHWID,
+		"totalGB": c.TotalGB, "flow": c.Flow, "group": c.Group,
+		"comment": c.Comment, "tgId": c.TgID,
+	} {
+		encoded, marshalErr := json.Marshal(value)
+		if marshalErr != nil {
+			return nil, marshalErr
+		}
+		fields[key] = encoded
+	}
+	return json.Marshal(fields)
+}
+
+// InboundOption is the lightweight dropdown projection returned by 3x-ui.
+// Keep only fields used by the bot's plan editor; the panel owns the remaining
+// capability metadata in its public schema.
+type InboundOption struct {
+	ID       int    `json:"id"`
+	Remark   string `json:"remark"`
+	Tag      string `json:"tag"`
+	Protocol string `json:"protocol"`
+	Port     int    `json:"port"`
+	Enable   bool   `json:"enable"`
 }
 type envelope struct {
 	Success bool            `json:"success"`
@@ -251,6 +319,64 @@ func (c *Client) ListInboundAttachments(ctx context.Context) ([]InboundAttachmen
 // ListInboundOptions returns known inbound IDs for validating archived
 // attachment references before an instance restore.
 func (c *Client) ListInboundOptions(ctx context.Context) ([]int, error) {
+	options, err := c.ListInbounds(ctx)
+	if err != nil {
+		return nil, err
+	}
+	ids := make([]int, 0, len(options))
+	for _, option := range options {
+		ids = append(ids, option.ID)
+	}
+	return ids, nil
+}
+
+// CustomerClientComment preserves the customer's configured device allowance
+// in the 3x-ui comment while keeping the panel's own IP limit disabled. The
+// "devices:" marker matches comments created by the legacy bots.
+func CustomerClientComment(planName string, telegramID int64, deviceLimit int) string {
+	planName = strings.Map(func(r rune) rune {
+		if r < 0x20 || r == 0x7f {
+			return ' '
+		}
+		return r
+	}, strings.TrimSpace(planName))
+	planName = strings.Join(strings.Fields(planName), " ")
+	if planName == "" {
+		planName = "VPN service"
+	}
+	if deviceLimit < 0 {
+		deviceLimit = 0
+	}
+	return fmt.Sprintf("created by xui-backend, devices: %d, plan: %s, telegram_id: %d", deviceLimit, planName, telegramID)
+}
+
+var customerDeviceMarker = regexp.MustCompile(`(?i)(\bdevices\s*:\s*)\d+`)
+
+// UpdateCustomerDeviceComment changes only the legacy-compatible device count
+// marker, preserving panel/operator notes around it.
+func UpdateCustomerDeviceComment(comment string, deviceLimit int) (string, error) {
+	if deviceLimit < 0 {
+		return "", errors.New("device limit cannot be negative")
+	}
+	matches := customerDeviceMarker.FindAllStringSubmatchIndex(comment, -1)
+	if len(matches) != 1 {
+		return "", errors.New("client comment must contain exactly one devices marker")
+	}
+	match := matches[0]
+	return comment[:match[0]] + comment[match[2]:match[3]] + fmt.Sprint(deviceLimit) + comment[match[1]:], nil
+}
+
+func CustomerDeviceLimit(comment string) (int, error) {
+	matches := customerDeviceMarker.FindAllStringSubmatchIndex(comment, -1)
+	if len(matches) != 1 {
+		return 0, errors.New("client comment must contain exactly one devices marker")
+	}
+	return strconv.Atoi(comment[matches[0][3]:matches[0][1]])
+}
+
+// ListInbounds returns the metadata needed to choose actual panel inbounds
+// while building a plan. It uses the documented lightweight picker endpoint.
+func (c *Client) ListInbounds(ctx context.Context) ([]InboundOption, error) {
 	env, err := c.request(ctx, http.MethodGet, "/panel/api/inbounds/options", nil)
 	if err != nil {
 		return nil, err
@@ -258,20 +384,16 @@ func (c *Client) ListInboundOptions(ctx context.Context) ([]int, error) {
 	if !env.Success {
 		return nil, fmt.Errorf("panel inbound options rejected: %s", bounded(env.Msg))
 	}
-	var rows []struct {
-		ID int `json:"id"`
-	}
-	if len(env.Obj) == 0 || string(env.Obj) == "null" || json.Unmarshal(env.Obj, &rows) != nil {
+	var options []InboundOption
+	if len(env.Obj) == 0 || string(env.Obj) == "null" || json.Unmarshal(env.Obj, &options) != nil {
 		return nil, errors.New("panel inbound options response is untyped")
 	}
-	ids := make([]int, 0, len(rows))
-	for _, row := range rows {
-		if row.ID <= 0 {
+	for _, option := range options {
+		if option.ID <= 0 {
 			return nil, errors.New("panel inbound options omitted inbound ID")
 		}
-		ids = append(ids, row.ID)
 	}
-	return ids, nil
+	return options, nil
 }
 
 func (c *Client) Add(ctx context.Context, config ClientConfig, inbounds []int) WriteResult {
@@ -284,6 +406,25 @@ func (c *Client) Add(ctx context.Context, config ClientConfig, inbounds []int) W
 	}
 	if err == nil {
 		err = fmt.Errorf("panel add returned success=false: %s", bounded(env.Msg))
+	}
+	return WriteResult{Outcome: Unknown, Err: err}
+}
+
+// Update replaces the full client row in 3x-ui. The caller must first read the
+// current client and carry its unowned fields through ClientConfig.Extra.
+func (c *Client) Update(ctx context.Context, email string, config ClientConfig) WriteResult {
+	if err := c.CheckWriteReadiness(ctx); err != nil {
+		return WriteResult{Outcome: DefinitiveNoWrite, Err: err}
+	}
+	if strings.TrimSpace(email) == "" || config.Email != email {
+		return WriteResult{Outcome: DefinitiveNoWrite, Err: errors.New("client update email must match the existing row")}
+	}
+	env, err := c.request(ctx, http.MethodPost, "/panel/api/clients/update/"+url.PathEscape(email), config)
+	if err == nil && env.Success {
+		return WriteResult{Outcome: Succeeded}
+	}
+	if err == nil {
+		err = fmt.Errorf("panel update may have partially applied: %s", bounded(env.Msg))
 	}
 	return WriteResult{Outcome: Unknown, Err: err}
 }

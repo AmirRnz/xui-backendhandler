@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -35,7 +36,11 @@ type AdminPlan struct {
 	InboundIDs              []int                   `json:"inbound_ids"`
 	DiscountTiers           []commerce.DiscountTier `json:"discount_tiers"`
 	UsageDescription        string                  `json:"usage_description"`
+	IsGlobal                bool                    `json:"is_global"`
+	AllowedTelegramIDs      []int64                 `json:"allowed_telegram_ids"`
 }
+
+const maxAdminPlanLifetimeSeconds = int64(10 * 365 * 24 * 60 * 60)
 
 type AdminConfiguration struct {
 	DeploymentID        string            `json:"deployment_id"`
@@ -92,7 +97,12 @@ func (s *Store) AdminConfiguration(ctx context.Context, deployment string) (*Adm
 	c.Panel = map[string]any{"id": panelID, "base_url": baseURL, "token_configured": tokenConfigured}
 	rows, err := s.DB.Query(ctx, `SELECT id,name,kind,enabled,is_limited,description,base_price_toman,price_per_extra_ip_toman,
 		price_per_gb_toman,price_per_extra_month_toman,base_ip_limit,max_ip_limit,min_data_gb,max_data_bytes,expire_seconds,
-		test_ip_limit,max_per_day,flow,COALESCE(array_to_json(inbound_ids)::text,'[]'),discount_tiers::text,usage_description
+		test_ip_limit,max_per_day,flow,COALESCE(array_to_json(inbound_ids)::text,'[]'),discount_tiers::text,usage_description,is_global,
+		COALESCE((SELECT array_to_json(array_agg(DISTINCT a.telegram_id ORDER BY a.telegram_id))::text
+			FROM plan_access pa
+			JOIN commercial_accounts ca ON ca.home_deployment_id=pa.deployment_id AND ca.id=pa.account_id
+			JOIN actors a ON a.deployment_id=ca.home_deployment_id AND a.account_id=ca.id
+			WHERE pa.deployment_id=plans.deployment_id AND pa.plan_id=plans.id),'[]')
 		FROM plans WHERE deployment_id=$1 ORDER BY id`, deployment)
 	if err != nil {
 		return nil, err
@@ -100,10 +110,10 @@ func (s *Store) AdminConfiguration(ctx context.Context, deployment string) (*Adm
 	defer rows.Close()
 	for rows.Next() {
 		var p AdminPlan
-		var ids, discounts string
+		var ids, discounts, allowedTelegramIDs string
 		if err = rows.Scan(&p.ID, &p.Name, &p.Kind, &p.Enabled, &p.IsLimited, &p.Description, &p.BasePriceToman, &p.PricePerExtraIPToman,
 			&p.PricePerGBToman, &p.PricePerExtraMonthToman, &p.BaseIPLimit, &p.MaxIPLimit, &p.MinDataGB, &p.MaxDataBytes, &p.ExpireSeconds,
-			&p.TestIPLimit, &p.MaxPerDay, &p.Flow, &ids, &discounts, &p.UsageDescription); err != nil {
+			&p.TestIPLimit, &p.MaxPerDay, &p.Flow, &ids, &discounts, &p.UsageDescription, &p.IsGlobal, &allowedTelegramIDs); err != nil {
 			return nil, err
 		}
 		if err = json.Unmarshal([]byte(ids), &p.InboundIDs); err != nil {
@@ -118,30 +128,62 @@ func (s *Store) AdminConfiguration(ctx context.Context, deployment string) (*Adm
 		if p.DiscountTiers == nil {
 			p.DiscountTiers = []commerce.DiscountTier{}
 		}
+		if err = json.Unmarshal([]byte(allowedTelegramIDs), &p.AllowedTelegramIDs); err != nil {
+			return nil, err
+		}
+		if p.AllowedTelegramIDs == nil {
+			p.AllowedTelegramIDs = []int64{}
+		}
 		c.Plans = append(c.Plans, p)
 	}
 	return c, rows.Err()
 }
 
 func validateAdminPlan(p AdminPlan) error {
-	if strings.TrimSpace(p.Name) == "" || len(p.Name) > 120 || (p.Kind != "paid" && p.Kind != "test") {
+	if strings.TrimSpace(p.Name) == "" || len(p.Name) > 120 || len(p.Description) > 2048 || len(p.UsageDescription) > 4096 || len(p.Flow) > 120 || (p.Kind != "paid" && p.Kind != "test") {
 		return fmt.Errorf("%w: plan name and kind are invalid", ErrInvalidAdminConfig)
 	}
-	if p.BasePriceToman < 0 || p.PricePerExtraIPToman < 0 || p.PricePerGBToman < 0 || p.PricePerExtraMonthToman < 0 || p.BaseIPLimit < 0 || p.MaxIPLimit < p.BaseIPLimit || p.MinDataGB < 0 || p.MaxDataBytes < 0 || p.ExpireSeconds < 0 || p.TestIPLimit < 0 || p.MaxPerDay < 0 || len(p.InboundIDs) > 64 {
+	if p.BasePriceToman < 0 || p.PricePerExtraIPToman < 0 || p.PricePerGBToman < 0 || p.PricePerExtraMonthToman < 0 || p.BaseIPLimit < 0 || p.MaxIPLimit < p.BaseIPLimit || p.MaxIPLimit > 10000 || p.MinDataGB < 0 || p.MinDataGB > 100000 || p.MaxDataBytes < 0 || p.ExpireSeconds < 0 || p.ExpireSeconds > maxAdminPlanLifetimeSeconds || p.TestIPLimit < 0 || p.TestIPLimit > 10000 || p.MaxPerDay < 0 || p.MaxPerDay > 10000 || len(p.InboundIDs) > 64 {
 		return fmt.Errorf("%w: plan values are outside allowed bounds", ErrInvalidAdminConfig)
 	}
+	if p.Enabled && len(p.InboundIDs) == 0 {
+		return fmt.Errorf("%w: an enabled plan must have at least one inbound", ErrInvalidAdminConfig)
+	}
+	seenInboundIDs := make(map[int]struct{}, len(p.InboundIDs))
 	for _, id := range p.InboundIDs {
 		if id <= 0 {
 			return fmt.Errorf("%w: inbound_ids must contain positive IDs", ErrInvalidAdminConfig)
 		}
+		if _, exists := seenInboundIDs[id]; exists {
+			return fmt.Errorf("%w: inbound_ids must not contain duplicates", ErrInvalidAdminConfig)
+		}
+		seenInboundIDs[id] = struct{}{}
 	}
 	if len(p.DiscountTiers) > 64 {
 		return fmt.Errorf("%w: discount_tiers has too many entries", ErrInvalidAdminConfig)
 	}
+	seenDiscountMonths := make(map[int]struct{}, len(p.DiscountTiers))
 	for _, tier := range p.DiscountTiers {
 		if tier.Months < 1 || tier.BasisPoints < 0 || tier.BasisPoints > 10000 {
 			return fmt.Errorf("%w: discount tiers require positive months and basis points 0..10000", ErrInvalidAdminConfig)
 		}
+		if _, exists := seenDiscountMonths[tier.Months]; exists {
+			return fmt.Errorf("%w: discount tiers cannot repeat a month count", ErrInvalidAdminConfig)
+		}
+		seenDiscountMonths[tier.Months] = struct{}{}
+	}
+	if len(p.AllowedTelegramIDs) > 256 {
+		return fmt.Errorf("%w: allowed_telegram_ids has too many entries", ErrInvalidAdminConfig)
+	}
+	seenTelegramIDs := make(map[int64]struct{}, len(p.AllowedTelegramIDs))
+	for _, id := range p.AllowedTelegramIDs {
+		if id <= 0 {
+			return fmt.Errorf("%w: allowed_telegram_ids must contain positive IDs", ErrInvalidAdminConfig)
+		}
+		if _, exists := seenTelegramIDs[id]; exists {
+			return fmt.Errorf("%w: allowed_telegram_ids must not contain duplicates", ErrInvalidAdminConfig)
+		}
+		seenTelegramIDs[id] = struct{}{}
 	}
 	return nil
 }
@@ -155,11 +197,12 @@ func (s *Store) SaveAdminPlan(ctx context.Context, deployment string, actorID in
 		return 0, err
 	}
 	defer tx.Rollback(ctx)
-	var panelID string
-	if err := tx.QueryRow(ctx, `SELECT default_panel_id FROM deployments WHERE id=$1 AND enabled`, deployment).Scan(&panelID); err != nil {
+	var panelID, channel string
+	if err := tx.QueryRow(ctx, `SELECT default_panel_id,channel FROM deployments WHERE id=$1 AND enabled`, deployment).Scan(&panelID, &channel); err != nil {
 		return 0, err
 	}
 	if p.ID == 0 {
+		p.IsGlobal = len(p.AllowedTelegramIDs) == 0
 		if p.DiscountTiers == nil {
 			p.DiscountTiers = []commerce.DiscountTier{}
 		}
@@ -167,14 +210,19 @@ func (s *Store) SaveAdminPlan(ctx context.Context, deployment string, actorID in
 		if err != nil {
 			return 0, err
 		}
-		err = tx.QueryRow(ctx, `INSERT INTO plans(deployment_id,panel_id,kind,name,enabled,is_limited,description,base_price_toman,price_per_extra_ip_toman,
+		err = tx.QueryRow(ctx, `INSERT INTO plans(deployment_id,panel_id,kind,name,enabled,is_limited,is_global,description,base_price_toman,price_per_extra_ip_toman,
 		price_per_gb_toman,price_per_extra_month_toman,base_ip_limit,max_ip_limit,min_data_gb,max_data_bytes,expire_seconds,test_ip_limit,max_per_day,flow,inbound_ids,usage_description,discount_tiers)
-		VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22::jsonb) RETURNING id`, deployment, panelID, p.Kind, strings.TrimSpace(p.Name), p.Enabled, p.IsLimited, p.Description, p.BasePriceToman, p.PricePerExtraIPToman, p.PricePerGBToman, p.PricePerExtraMonthToman, p.BaseIPLimit, p.MaxIPLimit, p.MinDataGB, p.MaxDataBytes, p.ExpireSeconds, p.TestIPLimit, p.MaxPerDay, p.Flow, p.InboundIDs, p.UsageDescription, discountJSON).Scan(&p.ID)
+		VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23::jsonb) RETURNING id`, deployment, panelID, p.Kind, strings.TrimSpace(p.Name), p.Enabled, p.IsLimited, p.IsGlobal, p.Description, p.BasePriceToman, p.PricePerExtraIPToman, p.PricePerGBToman, p.PricePerExtraMonthToman, p.BaseIPLimit, p.MaxIPLimit, p.MinDataGB, p.MaxDataBytes, p.ExpireSeconds, p.TestIPLimit, p.MaxPerDay, p.Flow, p.InboundIDs, p.UsageDescription, discountJSON).Scan(&p.ID)
 		if err != nil {
 			return 0, err
 		}
 		if err = recordAdminAudit(ctx, tx, deployment, actorID, "plan_created", fmt.Sprintf("plan:%d", p.ID)); err != nil {
 			return 0, err
+		}
+		if len(p.AllowedTelegramIDs) > 0 {
+			if err = replacePlanAccess(ctx, tx, deployment, channel, p.ID, actorID, p.AllowedTelegramIDs); err != nil {
+				return 0, err
+			}
 		}
 		if err = tx.Commit(ctx); err != nil {
 			return 0, err
@@ -200,10 +248,53 @@ func (s *Store) SaveAdminPlan(ctx context.Context, deployment string, actorID in
 	if err = recordAdminAudit(ctx, tx, deployment, actorID, "plan_updated", fmt.Sprintf("plan:%d", p.ID)); err != nil {
 		return 0, err
 	}
+	if p.AllowedTelegramIDs != nil {
+		if err = replacePlanAccess(ctx, tx, deployment, channel, p.ID, actorID, p.AllowedTelegramIDs); err != nil {
+			return 0, err
+		}
+	}
 	if err = tx.Commit(ctx); err != nil {
 		return 0, err
 	}
 	return p.ID, nil
+}
+
+func replacePlanAccess(ctx context.Context, tx pgx.Tx, deployment, channel string, planID, adminActorID int64, telegramIDs []int64) error {
+	if _, err := tx.Exec(ctx, `DELETE FROM plan_access WHERE deployment_id=$1 AND plan_id=$2`, deployment, planID); err != nil {
+		return err
+	}
+	if len(telegramIDs) == 0 {
+		_, err := tx.Exec(ctx, `UPDATE plans SET is_global=true,updated_at=now() WHERE deployment_id=$1 AND id=$2`, deployment, planID)
+		return err
+	}
+	if _, err := tx.Exec(ctx, `UPDATE plans SET is_global=false,updated_at=now() WHERE deployment_id=$1 AND id=$2`, deployment, planID); err != nil {
+		return err
+	}
+	accountKind, actorRole := "retail_customer", "customer"
+	if channel == "reseller" {
+		accountKind, actorRole = "reseller", "reseller"
+	}
+	seenAccounts := make(map[int64]struct{}, len(telegramIDs))
+	for _, telegramID := range telegramIDs {
+		var accountID int64
+		err := tx.QueryRow(ctx, `SELECT a.account_id FROM actors a
+			JOIN commercial_accounts ca ON ca.home_deployment_id=a.deployment_id AND ca.id=a.account_id
+			WHERE a.deployment_id=$1 AND a.telegram_id=$2 AND a.role=$3 AND a.enabled AND ca.kind=$4 AND ca.status='active'`, deployment, telegramID, actorRole, accountKind).Scan(&accountID)
+		if err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return fmt.Errorf("%w: allowed Telegram user %d has not started this bot as an active %s", ErrInvalidAdminConfig, telegramID, actorRole)
+			}
+			return err
+		}
+		if _, exists := seenAccounts[accountID]; exists {
+			continue
+		}
+		if _, err = tx.Exec(ctx, `INSERT INTO plan_access(deployment_id,plan_id,account_id,granted_by) VALUES($1,$2,$3,$4)`, deployment, planID, accountID, adminActorID); err != nil {
+			return err
+		}
+		seenAccounts[accountID] = struct{}{}
+	}
+	return nil
 }
 
 func (s *Store) SavePaymentInstructions(ctx context.Context, deployment string, actorID int64, card, owner, instructions string) error {
